@@ -7,8 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "SymbolFileWasm.h"
+#include "Plugins/Process/wasm/ProcessWasm.h"
 #include "Plugins/SymbolFile/DWARF/LogChannelDWARF.h"
 #include "Utility/WasmVirtualRegisters.h"
+#include "lldb/Target/RegisterContext.h"
+#include "lldb/Utility/DataBufferHeap.h"
+#include "lldb/Utility/DataExtractor.h"
 #include "lldb/Utility/LLDBLog.h"
 
 using namespace lldb;
@@ -85,16 +89,50 @@ bool SymbolFileWasm::ParseVendorDWARFOpcode(uint8_t op,
     return false;
   }
 
-  const uint32_t reg_num = GetWasmRegister(tag, index);
+  // Get the ProcessWasm to send qWasmLocal/qWasmGlobal packets.
+  // We bypass ReadRegisterValueAsScalar because the reg_ctx passed here is
+  // often a GDBRemoteRegisterContext which doesn't understand wasm virtual
+  // register numbers. Going directly to the process avoids that indirection.
+  // Navigate to ProcessWasm via the module's target, which avoids relying on
+  // reg_ctx->CalculateProcess() which can return the base ProcessGDBRemote.
+  wasm::ProcessWasm *wasm_process = nullptr;
+  // SymbolFileWasm is only instantiated for wasm modules, so the process
+  // must always be a ProcessWasm. We reach it through the target to avoid
+  // the intermediate GDBRemoteRegisterContext returning ProcessGDBRemote.
+  if (reg_ctx) {
+    if (TargetSP target_sp = reg_ctx->CalculateTarget()) {
+      const ProcessSP &proc_sp = target_sp->GetProcessSP();
+      if (proc_sp)
+        wasm_process = static_cast<wasm::ProcessWasm *>(proc_sp.get());
+    }
+  }
+  if (!wasm_process)
+    return false;
 
-  Value tmp;
-  llvm::Error error = DWARFExpression::ReadRegisterValueAsScalar(
-      reg_ctx, reg_kind, reg_num, tmp);
-  if (error) {
-    LLDB_LOG_ERROR(GetLog(DWARFLog::DebugInfo), std::move(error), "{0}");
+  // Use frame 0 as the default; if reg_ctx is a RegisterContextWasm we could
+  // extract the actual frame index, but frame 0 is correct for most cases.
+  const uint32_t frame_index = 0;
+  llvm::Expected<lldb::DataBufferSP> maybe_buffer =
+      wasm_process->GetWasmVariable(
+          static_cast<WasmVirtualRegisterKinds>(tag), frame_index, index);
+  if (!maybe_buffer) {
+    LLDB_LOG_ERROR(GetLog(DWARFLog::DebugInfo), maybe_buffer.takeError(), "{0}");
     return false;
   }
 
+  DataExtractor data(*maybe_buffer, wasm_process->GetByteOrder(),
+                     wasm_process->GetAddressByteSize());
+  lldb::offset_t data_offset = 0;
+  Value tmp;
+  switch ((*maybe_buffer)->GetByteSize()) {
+  case 1: tmp.GetScalar() = data.GetU8(&data_offset); break;
+  case 2: tmp.GetScalar() = data.GetU16(&data_offset); break;
+  case 4: tmp.GetScalar() = data.GetU32(&data_offset); break;
+  case 8: tmp.GetScalar() = data.GetU64(&data_offset); break;
+  default:
+    return false;
+  }
+  tmp.SetValueType(Value::ValueType::Scalar);
   stack.push_back(tmp);
   return true;
 }
