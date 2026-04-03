@@ -36,14 +36,12 @@
 #include "lldb/API/SBValue.h"
 #include "lldb/Utility/Connection.h"
 #include "lldb/Utility/Timeout.h"
-#include "ConnectionInProcess.h"
+#include "InProcessChannel.h"
 
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <emscripten.h>
-#include <map>
-#include <mutex>
 #include <string>
 #include <sys/stat.h>
 
@@ -635,54 +633,33 @@ EMSCRIPTEN_KEEPALIVE void lldb_wasm_free_string(char *s) { free(s); }
 // In-process transport
 // ---------------------------------------------------------------------------
 //
-// Creates a pair of connected endpoints so that a GDB remote server running
-// in the same wasm module can communicate with LLDB without going through
-// sockets. The LLDB side is injected via lldb_wasm_connect_inprocess(); the
-// server side is accessed via lldb_wasm_channel_server_write/read.
-//
-// Channel lifetime: channels are heap-allocated and tracked in a global map.
-// They are freed when the associated debugger is destroyed or when both sides
-// call Disconnect.
-
-struct ChannelPair {
-  std::unique_ptr<lldb_private::ConnectionInProcess> lldb_side;
-  std::unique_ptr<lldb_private::ConnectionInProcess> server_side;
-};
-
-static std::mutex g_channel_mutex;
-static uint32_t g_next_channel_id = 1;
-static std::map<uint32_t, ChannelPair> g_channels;
+// When the GDB remote server runs in the same wasm module as LLDB, TCP sockets
+// are replaced by an in-memory channel pair (ConnectionInProcess). The channel
+// registry lives in InProcessChannel.cpp (part of the ProcessWasm plugin).
+// ProcessWasm::DoConnectRemote handles the "inprocess://<id>" URL scheme and
+// claims the LLDB endpoint; these functions manage the lifecycle from the JS
+// API side and give the GDB server access to its endpoint.
 
 // Create an in-process channel. Returns a channel ID (> 0).
-// The channel has two endpoints: the LLDB side (used by lldb_wasm_connect_inprocess)
-// and the server side (used by lldb_wasm_channel_server_write/read).
 EMSCRIPTEN_KEEPALIVE uint32_t lldb_wasm_create_channel() {
-  auto [lldb_end, server_end] = lldb_private::ConnectionInProcess::CreatePair();
-  std::lock_guard<std::mutex> lock(g_channel_mutex);
-  uint32_t id = g_next_channel_id++;
-  g_channels[id] = {std::move(lldb_end), std::move(server_end)};
-  return id;
+  return lldb_private::wasm::CreateInProcessChannel();
 }
 
-// Connect a debugger to an in-process channel previously created with
-// lldb_wasm_create_channel(). Returns 0 on success.
+// Connect a debugger to an in-process channel.
 //
-// This creates a wasm32 target and attaches to it using the channel's LLDB
-// endpoint as the connection transport. The channel's server endpoint remains
-// available for the server to use.
+// This creates a wasm32 target, then calls ConnectRemote with the URL
+// "inprocess://<channel_id>". ProcessWasm::DoConnectRemote intercepts that
+// URL, claims the LLDB endpoint from the registry, injects it into the GDB
+// remote communicator, and performs the GDB remote handshake.
+//
+// The GDB server MUST be running and ready to respond to the handshake before
+// this is called (it blocks until the handshake completes).
+//
+// Returns 0 on success.
 EMSCRIPTEN_KEEPALIVE int lldb_wasm_connect_inprocess(uint32_t handle,
                                                      uint32_t channel_id) {
   if (!handle)
     return 1;
-
-  lldb_private::ConnectionInProcess *conn = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_channel_mutex);
-    auto it = g_channels.find(channel_id);
-    if (it == g_channels.end())
-      return 1;
-    conn = it->second.lldb_side.get();
-  }
 
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
@@ -692,69 +669,50 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_connect_inprocess(uint32_t handle,
   if (!target.IsValid())
     return 1;
 
-  // Connect using the in-process connection object.
+  // Encode the channel ID in the URL. ProcessWasm::DoConnectRemote parses it.
+  std::string url = "inprocess://" + std::to_string(channel_id);
   lldb::SBListener listener = d->GetListener();
   lldb::SBProcess process =
-      target.ConnectRemote(listener, "inprocess://", "wasm", error);
-  if (!process.IsValid())
-    return 1;
-
-  // Inject the in-process connection into the GDB remote communication.
-  // ProcessGDBRemote::DoConnectRemote calls m_gdb_comm.SetConnection().
-  // We cannot do this via the SB API directly, so instead we pre-populate
-  // the connection before ConnectRemote is called. The URL "inprocess://"
-  // won't be resolved by ConnectionFileDescriptor; we rely on the caller
-  // to set up the connection via this function after ConnectRemote would
-  // have failed.
-  //
-  // TODO: implement the inprocess:// scheme in ConnectionFileDescriptor so
-  // the channel is injected at the right point. For now this is a placeholder
-  // that at least creates the target and process objects.
-  return 0;
+      target.ConnectRemote(listener, url.c_str(), "wasm", error);
+  return (process.IsValid() && error.Success()) ? 0 : 1;
 }
 
-// Server side: write data into the channel (server -> LLDB direction).
-// Returns the number of bytes written, or -1 on error.
+// Server side: write bytes into the channel (server → LLDB).
+// Returns bytes written, or -1 if the channel does not exist.
 EMSCRIPTEN_KEEPALIVE int lldb_wasm_channel_server_write(uint32_t channel_id,
                                                         const uint8_t *data,
                                                         uint32_t size) {
-  std::lock_guard<std::mutex> lock(g_channel_mutex);
-  auto it = g_channels.find(channel_id);
-  if (it == g_channels.end() || !it->second.server_side)
+  lldb_private::Connection *conn =
+      lldb_private::wasm::GetServerConnection(channel_id);
+  if (!conn)
     return -1;
   lldb::ConnectionStatus status;
-  size_t n = it->second.server_side->Write(data, size, status, nullptr);
-  return static_cast<int>(n);
+  return static_cast<int>(conn->Write(data, size, status, nullptr));
 }
 
-// Server side: read data from the channel (LLDB -> server direction).
-// Blocks for up to timeout_ms milliseconds. Returns bytes read, or -1 on error.
+// Server side: read bytes from the channel (LLDB → server).
+// Blocks for up to timeout_ms milliseconds (0 = wait forever).
+// Returns bytes read, or -1 if the channel does not exist.
 EMSCRIPTEN_KEEPALIVE int lldb_wasm_channel_server_read(uint32_t channel_id,
                                                        uint8_t *buf,
                                                        uint32_t size,
                                                        uint32_t timeout_ms) {
-  lldb_private::ConnectionInProcess *conn = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_channel_mutex);
-    auto it = g_channels.find(channel_id);
-    if (it == g_channels.end() || !it->second.server_side)
-      return -1;
-    conn = it->second.server_side.get();
-  }
+  lldb_private::Connection *conn =
+      lldb_private::wasm::GetServerConnection(channel_id);
+  if (!conn)
+    return -1;
   lldb::ConnectionStatus status;
   lldb_private::Timeout<std::micro> timeout =
       timeout_ms > 0
           ? lldb_private::Timeout<std::micro>(
                 std::chrono::microseconds(timeout_ms * 1000LL))
           : lldb_private::Timeout<std::micro>(std::nullopt);
-  size_t n = conn->Read(buf, size, timeout, status, nullptr);
-  return static_cast<int>(n);
+  return static_cast<int>(conn->Read(buf, size, timeout, status, nullptr));
 }
 
-// Destroy a channel and free its resources.
+// Destroy a channel and release both its connection endpoints.
 EMSCRIPTEN_KEEPALIVE void lldb_wasm_destroy_channel(uint32_t channel_id) {
-  std::lock_guard<std::mutex> lock(g_channel_mutex);
-  g_channels.erase(channel_id);
+  lldb_private::wasm::DestroyInProcessChannel(channel_id);
 }
 
 // ---------------------------------------------------------------------------

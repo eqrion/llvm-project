@@ -7,7 +7,8 @@ get_property(LLDB_ALL_PLUGINS GLOBAL PROPERTY LLDB_PLUGINS)
 add_executable(lldb-wasm lldb-wasm.cpp)
 
 target_include_directories(lldb-wasm PRIVATE
-  ${LLDB_SOURCE_DIR}/source/Host/emscripten)
+  ${LLDB_SOURCE_DIR}/source/Host/emscripten
+  ${LLDB_SOURCE_DIR}/source/Plugins/Process/wasm)
 
 target_link_libraries(lldb-wasm PRIVATE liblldb)
 

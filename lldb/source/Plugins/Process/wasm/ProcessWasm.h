@@ -65,6 +65,8 @@ public:
 
   llvm::StringRef GetPluginName() override;
 
+  Status DoConnectRemote(llvm::StringRef remote_url) override;
+
   size_t ReadMemory(lldb::addr_t vm_addr, void *buf, size_t size,
                     Status &error) override;
 

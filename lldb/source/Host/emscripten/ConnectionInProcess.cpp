@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ConnectionInProcess.h"
+#include "lldb/Host/emscripten/ConnectionInProcess.h"
 
 #include "lldb/Utility/Status.h"
 #include "lldb/Utility/Timeout.h"

@@ -206,8 +206,9 @@ function makeDispatch(): Map<string, Handler> {
     const buf = mod._malloc(bytes.length);
     mod.HEAPU8.set(bytes, buf);
     const n = ccall('lldb_wasm_channel_server_write', 'number',
-      ['number', 'number', 'number'], [channelId, buf, bytes.length]);
+      ['number', 'number', 'number'], [channelId, buf, bytes.length]) as number;
     mod._free(buf);
+    if (n < 0) throw new Error(`channel ${String(channelId)} not found`);
     return n;
   });
 
@@ -217,6 +218,7 @@ function makeDispatch(): Map<string, Handler> {
       const n = ccall('lldb_wasm_channel_server_read', 'number',
         ['number', 'number', 'number', 'number'],
         [channelId, buf, maxBytes, timeoutMs]) as number;
+      if (n < 0) throw new Error(`channel ${String(channelId)} not found`);
       return n > 0 ? Array.from(mod.HEAPU8.subarray(buf, buf + n)) : [];
     } finally {
       mod._free(buf);

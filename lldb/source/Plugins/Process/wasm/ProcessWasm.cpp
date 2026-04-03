@@ -7,11 +7,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "ProcessWasm.h"
+#include "InProcessChannel.h"
 #include "ThreadWasm.h"
 #include "lldb/Core/Module.h"
 #include "lldb/Core/PluginManager.h"
 #include "lldb/Core/Value.h"
 #include "lldb/Utility/DataBufferHeap.h"
+#include "lldb/Utility/Status.h"
 
 #include "lldb/Target/UnixSignals.h"
 
@@ -59,6 +61,32 @@ lldb::ProcessSP ProcessWasm::CreateInstance(lldb::TargetSP target_sp,
   if (crash_file_path == nullptr)
     return std::make_shared<ProcessWasm>(target_sp, listener_sp);
   return {};
+}
+
+Status ProcessWasm::DoConnectRemote(llvm::StringRef remote_url) {
+  // Handle the inprocess:// scheme used when the GDB server runs in the same
+  // wasm module. "inprocess://42" means channel ID 42.
+  if (remote_url.starts_with("inprocess://")) {
+    llvm::StringRef id_str = remote_url.drop_front(strlen("inprocess://"));
+    uint32_t channel_id = 0;
+    if (id_str.getAsInteger(10, channel_id))
+      return Status::FromErrorString(
+          "inprocess:// URL missing or invalid channel ID");
+
+    std::unique_ptr<Connection> conn = TakeConnectionForChannel(channel_id);
+    if (!conn)
+      return Status::FromErrorStringWithFormat(
+          "inprocess channel %u not found or already claimed", channel_id);
+
+    // Inject the connection. ConnectToDebugserver (called by the parent's
+    // DoConnectRemote) skips the socket-creation loop when the communicator
+    // reports IsConnected() == true, and proceeds directly to the GDB remote
+    // handshake. Pass an empty URL so that path is taken.
+    m_gdb_comm.SetConnection(std::move(conn));
+    return ProcessGDBRemote::DoConnectRemote("");
+  }
+
+  return ProcessGDBRemote::DoConnectRemote(remote_url);
 }
 
 bool ProcessWasm::CanDebug(lldb::TargetSP target_sp,
