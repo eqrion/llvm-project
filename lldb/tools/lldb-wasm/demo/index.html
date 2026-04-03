@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LLDB WebAssembly</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!--
+    Required HTTP headers for SharedArrayBuffer (Emscripten pthreads):
+      Cross-Origin-Opener-Policy: same-origin
+      Cross-Origin-Embedder-Policy: require-corp
+    The demo server (server.mjs) sets these automatically.
+  -->
+  <link rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: #1a1a1a;
+      color: #e0e0e0;
+      font-family: system-ui, sans-serif;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 16px;
+      background: #111;
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+    }
+
+    #toolbar h1 {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      color: #c9a96e;
+    }
+
+    #status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #555;
+      transition: background 0.3s;
+    }
+    #status-dot.loading { background: #c9a96e; animation: pulse 1s infinite; }
+    #status-dot.ready   { background: #4caf50; }
+    #status-dot.error   { background: #f44336; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    #status-text {
+      font-size: 12px;
+      color: #888;
+    }
+
+    #terminal-container {
+      flex: 1;
+      padding: 4px;
+      overflow: hidden;
+    }
+
+    #terminal-container .xterm { height: 100%; }
+
+    #loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(26, 26, 26, 0.95);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      z-index: 100;
+      transition: opacity 0.4s;
+    }
+
+    #loading-overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #loading-logo  { font-size: 48px; color: #c9a96e; }
+    #loading-label { font-size: 14px; color: #888; }
+
+    #loading-progress {
+      width: 200px;
+      height: 2px;
+      background: #333;
+      border-radius: 1px;
+      overflow: hidden;
+    }
+
+    #loading-bar {
+      height: 100%;
+      background: #c9a96e;
+      width: 0%;
+      transition: width 0.3s;
+    }
+  </style>
+</head>
+<body>
+
+<div id="loading-overlay">
+  <div id="loading-logo">⬡</div>
+  <div id="loading-label">Loading LLDB…</div>
+  <div id="loading-progress"><div id="loading-bar"></div></div>
+</div>
+
+<div id="app">
+  <div id="toolbar">
+    <div id="status-dot" class="loading"></div>
+    <h1>LLDB</h1>
+    <span id="status-text">Initializing…</span>
+  </div>
+  <div id="terminal-container"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script type="module">
+// Import LLDBClient from the compiled TypeScript package.
+// The server serves dist/ from the package root.
+import { LLDBClient } from '/dist/index.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function setStatus(state, text) {
+  document.getElementById('status-dot').className = state;
+  document.getElementById('status-text').textContent = text;
+}
+
+function setProgress(pct) {
+  document.getElementById('loading-bar').style.width = pct + '%';
+}
+
+function hideOverlay() {
+  document.getElementById('loading-overlay').classList.add('hidden');
+}
+
+// ---------------------------------------------------------------------------
+// Terminal
+// ---------------------------------------------------------------------------
+
+const term = new Terminal({
+  theme: {
+    background:    '#1a1a1a',
+    foreground:    '#e0e0e0',
+    cursor:        '#c9a96e',
+    cursorAccent:  '#1a1a1a',
+    black:         '#1a1a1a',
+    brightBlack:   '#555',
+    red:           '#f44336',
+    brightRed:     '#ef9a9a',
+    green:         '#4caf50',
+    brightGreen:   '#a5d6a7',
+    yellow:        '#c9a96e',
+    brightYellow:  '#ffe082',
+    blue:          '#42a5f5',
+    brightBlue:    '#90caf9',
+    magenta:       '#ab47bc',
+    brightMagenta: '#ce93d8',
+    cyan:          '#26c6da',
+    brightCyan:    '#80deea',
+    white:         '#e0e0e0',
+    brightWhite:   '#ffffff',
+  },
+  fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
+  fontSize: 13,
+  lineHeight: 1.4,
+  cursorBlink: true,
+  scrollback: 5000,
+});
+
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal-container'));
+fitAddon.fit();
+window.addEventListener('resize', () => fitAddon.fit());
+
+// ---------------------------------------------------------------------------
+// Line editor
+// ---------------------------------------------------------------------------
+
+class LineEditor {
+  #term;
+  #line = '';
+  #history = [];
+  #historyPos = -1;
+  #onSubmit;
+
+  constructor(term, onSubmit) {
+    this.#term = term;
+    this.#onSubmit = onSubmit;
+    term.onData(data => this.#handle(data));
+  }
+
+  #handle(data) {
+    for (const char of data) {
+      const code = char.charCodeAt(0);
+      if (char === '\r') {
+        this.#term.write('\r\n');
+        const line = this.#line.trim();
+        if (line) {
+          this.#history.unshift(line);
+          if (this.#history.length > 200) this.#history.pop();
+        }
+        this.#historyPos = -1;
+        this.#line = '';
+        this.#onSubmit(line);
+        return;
+      }
+      if (char === '\x7f' || code === 8) {
+        if (this.#line.length > 0) {
+          this.#line = this.#line.slice(0, -1);
+          this.#term.write('\b \b');
+        }
+        continue;
+      }
+      if (char === '\x1b[A') {
+        const next = Math.min(this.#historyPos + 1, this.#history.length - 1);
+        this.#setLine(this.#history[next] ?? '');
+        this.#historyPos = next;
+        continue;
+      }
+      if (char === '\x1b[B') {
+        const next = this.#historyPos - 1;
+        this.#historyPos = Math.max(next, -1);
+        this.#setLine(next >= 0 ? (this.#history[next] ?? '') : '');
+        continue;
+      }
+      if (code < 32) continue;
+      this.#line += char;
+      this.#term.write(char);
+    }
+  }
+
+  #setLine(newLine) {
+    this.#term.write('\r\x1b[K');
+    this.#term.write('\x1b[33m(lldb)\x1b[0m ');
+    this.#term.write(newLine);
+    this.#line = newLine;
+  }
+
+  prompt() {
+    this.#term.write('\x1b[33m(lldb)\x1b[0m ');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+function writeOutput(text) {
+  if (text) term.write(text.replace(/\n/g, '\r\n'));
+}
+
+function writeError(text) {
+  if (text) term.write('\x1b[31m' + text.replace(/\n/g, '\r\n') + '\x1b[0m');
+}
+
+function writeBanner(version) {
+  term.write('\x1b[1m\x1b[33mLLDB WebAssembly\x1b[0m\x1b[90m  –  ');
+  term.write(version.trim() || 'lldb (wasm build)');
+  term.write('\r\nType any LLDB command. No target is connected yet.\r\n\x1b[0m\r\n');
+}
+
+async function boot() {
+  setStatus('loading', 'Starting worker…');
+  setProgress(10);
+
+  let lldb;
+  try {
+    setProgress(30);
+    lldb = await LLDBClient.create();
+    setProgress(100);
+    setStatus('ready', 'Ready');
+    setTimeout(hideOverlay, 300);
+  } catch (err) {
+    setStatus('error', 'Failed to load LLDB');
+    writeError('Failed to initialize LLDB:\r\n' + err.message + '\r\n');
+    hideOverlay();
+    return;
+  }
+
+  const { output } = await lldb.runCommand('version');
+  writeBanner(output);
+
+  const editor = new LineEditor(term, async (line) => {
+    if (!line) { editor.prompt(); return; }
+    const result = await lldb.runCommand(line);
+    writeOutput(result.output);
+    writeError(result.error);
+    editor.prompt();
+  });
+
+  lldb.onStop(reason => {
+    term.write('\r\n\x1b[33m* ' + JSON.stringify(reason) + '\x1b[0m\r\n');
+    editor.prompt();
+  });
+
+  editor.prompt();
+}
+
+boot().catch(err => console.error('boot failed:', err));
+</script>
+</body>
+</html>

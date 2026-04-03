@@ -1,0 +1,44 @@
+export interface StopReason {
+  reason:
+    | 'breakpoint'
+    | 'step_complete'
+    | 'signal'
+    | 'exception'
+    | 'stopped'
+    | 'running'
+    | 'exited'
+    | 'none';
+  thread_id?: number;
+  bp_id?: number;
+  signal_name?: string;
+  exit_code?: number;
+}
+
+export interface FrameInfo {
+  index: number;
+  function: string;
+  file?: string;
+  line?: number;
+  pc: string;
+}
+
+export interface Variable {
+  name: string;
+  type: string;
+  value: string;
+}
+
+export interface CommandResult {
+  output: string;
+  error: string;
+  status: number;
+}
+
+export type ExpressionResult =
+  | { value: string; type: string; error?: never }
+  | { error: string; value?: never; type?: never };
+
+export interface LLDBClientOptions {
+  /** URL of lldb-wasm.js (the Emscripten output). Defaults to the bundled copy. */
+  wasmJsUrl?: string;
+}

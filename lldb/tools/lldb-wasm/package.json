@@ -1,0 +1,36 @@
+{
+  "name": "@firefox-devtools/lldb-wasm",
+  "version": "0.1.0",
+  "description": "LLDB compiled to WebAssembly for wasm debugging in Firefox DevTools",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "wasm/"
+  ],
+  "scripts": {
+    "copy-wasm": "node scripts/copy-wasm.mjs",
+    "build": "npm run copy-wasm && tsc",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/firefox-devtools/lldb-wasm"
+  },
+  "keywords": ["lldb", "webassembly", "wasm", "debugger", "devtools"],
+  "license": "Apache-2.0"
+}
