@@ -9,6 +9,7 @@
 #include "SymbolFileWasm.h"
 #include "Plugins/SymbolFile/DWARF/LogChannelDWARF.h"
 #include "Utility/WasmVirtualRegisters.h"
+#include "lldb/Expression/DWARFExpression.h"
 #include "lldb/Utility/LLDBLog.h"
 
 using namespace lldb;

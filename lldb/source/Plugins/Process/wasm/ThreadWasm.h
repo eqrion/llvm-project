@@ -28,6 +28,11 @@ public:
   lldb::RegisterContextSP
   CreateRegisterContextForFrame(StackFrame *frame) override;
 
+  /// Always returns a RegisterContextWasm so that DW_OP_WASM_location
+  /// expressions can be evaluated regardless of which context triggered the
+  /// evaluation (e.g. stop-reason display vs. explicit frame variable).
+  lldb::RegisterContextSP GetRegisterContext() override;
+
 protected:
   Unwind &GetUnwinder() override;
 

@@ -34,6 +34,18 @@ llvm::Expected<std::vector<lldb::addr_t>> ThreadWasm::GetWasmCallStack() {
   return llvm::createStringError("no process");
 }
 
+lldb::RegisterContextSP ThreadWasm::GetRegisterContext() {
+  if (m_reg_context_sp)
+    return m_reg_context_sp;
+  ProcessSP process_sp(GetProcess());
+  if (!process_sp)
+    return {};
+  ProcessWasm *wasm_process = static_cast<ProcessWasm *>(process_sp.get());
+  m_reg_context_sp = std::make_shared<RegisterContextWasm>(
+      *this, 0, wasm_process->GetRegisterInfo());
+  return m_reg_context_sp;
+}
+
 lldb::RegisterContextSP
 ThreadWasm::CreateRegisterContextForFrame(StackFrame *frame) {
   uint32_t concrete_frame_idx = 0;
