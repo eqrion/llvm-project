@@ -1,7 +1,9 @@
 import type { Response, WorkerMessage } from './protocol.js';
+import { watchForFileRequests, SAB_SIZE } from './fileprovider.js';
 import type {
   CommandResult,
   ExpressionResult,
+  FileProvider,
   FrameInfo,
   LLDBClientOptions,
   StopReason,
@@ -14,6 +16,7 @@ export class LLDBClient {
   readonly #stopListeners: Array<(r: StopReason) => void> = [];
   #nextId = 0;
   #destroyed = false;
+  #fileProvider: FileProvider | null = null;
 
   private constructor(worker: Worker) {
     this.#worker = worker;
@@ -87,9 +90,19 @@ export class LLDBClient {
         options.wasmJsUrl ??
         new URL('../wasm/lldb-wasm.js', import.meta.url).href;
 
+      const fileSAB = new SharedArrayBuffer(SAB_SIZE);
+
       const id = client.#nextId++;
       client.#pending.set(id, { resolve: () => {}, reject });
-      worker.postMessage({ id, method: 'init', wasmJsUrl });
+      worker.postMessage({ id, method: 'init', wasmJsUrl, fileSAB });
+
+      // Start the file-provider watch loop on the main thread.
+      // Runs for the lifetime of this client; exits when #destroyed is true.
+      void watchForFileRequests(
+        fileSAB,
+        () => client.#fileProvider,
+        () => client.#destroyed,
+      );
     });
 
     return client;
@@ -213,6 +226,32 @@ export class LLDBClient {
 
   destroyChannel(channelId: number): Promise<void> {
     return this.call('destroyChannel', channelId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Virtual filesystem / file provider
+  // -------------------------------------------------------------------------
+
+  /**
+   * Register a callback that LLDB calls when it needs to read a source file
+   * that does not already exist in the in-memory filesystem.
+   *
+   * The path argument is whatever the DWARF debug info recorded at compile
+   * time (e.g. /home/user/project/src/main.c). Return the raw file bytes, or
+   * null if the file is unavailable. Once fetched the file is cached in MEMFS
+   * and the callback is not called again for the same path.
+   *
+   * In Firefox DevTools this is typically wired to IOUtils.read() or to
+   * a source-map resolver.
+   *
+   * @example
+   * lldb.setFileProvider(async (path) => {
+   *   try { return await IOUtils.read(path); }
+   *   catch { return null; }
+   * });
+   */
+  setFileProvider(provider: FileProvider | null): void {
+    this.#fileProvider = provider;
   }
 
   // -------------------------------------------------------------------------

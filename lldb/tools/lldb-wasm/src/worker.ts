@@ -3,6 +3,10 @@
 
 import type { Request, Response, StopEvent, ReadyMessage, ErrorMessage } from './protocol.js';
 import type { StopReason } from './types.js';
+import {
+  SAB_STATUS_IDX, SAB_PATH_LEN_IDX, SAB_PATH_OFFSET, SAB_MAX_PATH,
+  SAB_DATA_LEN_IDX, SAB_DATA_OFFSET, SAB_MAX_DATA,
+} from './fileprovider.js';
 
 // ---------------------------------------------------------------------------
 // Environment abstraction: browser Web Worker vs Node worker_threads
@@ -261,6 +265,91 @@ function checkForStop(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Emscripten FS bridge: virtual file provider
+// ---------------------------------------------------------------------------
+//
+// Patches mod.FS.open so that when LLDB opens a source file that does not
+// exist in MEMFS, the worker synchronously blocks via Atomics.wait while
+// the main thread fetches the file content through whatever browser I/O
+// API it has registered. On success, the file is written into MEMFS and
+// LLDB proceeds as if it had always been there.
+//
+// This is safe because:
+//   - Atomics.wait is allowed in workers (not the main thread)
+//   - Emscripten proxies FS calls from pthreads to the main wasm worker,
+//     so blocking here does not stall LLDB's internal GDB remote threads
+
+function fetchFileSync(sab: SharedArrayBuffer, path: string): Uint8Array | null {
+  const i32 = new Int32Array(sab);
+  const u8  = new Uint8Array(sab);
+  const enc = new TextEncoder();
+
+  const pathBytes = enc.encode(path);
+  if (pathBytes.byteLength > SAB_MAX_PATH) return null;
+
+  u8.set(pathBytes, SAB_PATH_OFFSET);
+  Atomics.store(i32, SAB_PATH_LEN_IDX, pathBytes.byteLength);
+  Atomics.store(i32, SAB_STATUS_IDX, 1);   // pending
+  Atomics.notify(i32, SAB_STATUS_IDX);
+
+  // Block until the main thread responds (status changes away from 1).
+  Atomics.wait(i32, SAB_STATUS_IDX, 1);
+
+  const status = Atomics.load(i32, SAB_STATUS_IDX);
+  if (status !== 2) {
+    Atomics.store(i32, SAB_STATUS_IDX, 0);
+    Atomics.notify(i32, SAB_STATUS_IDX);
+    return null; // not found
+  }
+
+  const dataLen = Atomics.load(i32, SAB_DATA_LEN_IDX);
+  const data = u8.slice(SAB_DATA_OFFSET, SAB_DATA_OFFSET + dataLen);
+
+  // Reset to idle so the main thread's watch loop can block again.
+  Atomics.store(i32, SAB_STATUS_IDX, 0);
+  Atomics.notify(i32, SAB_STATUS_IDX);
+  return data;
+}
+
+function ensureDirs(FS: Record<string, (...a: unknown[]) => unknown>, path: string): void {
+  const parts = path.split('/');
+  let current = '';
+  for (let i = 1; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (!p) continue;
+    current += '/' + p;
+    try { (FS['mkdir'] as (p: string) => void)(current); } catch { /* already exists */ }
+  }
+}
+
+function installFSBridge(sab: SharedArrayBuffer): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const FS = (mod as any).FS as Record<string, unknown> | undefined;
+  if (!FS || typeof FS['open'] !== 'function') return;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const origOpen = (FS['open'] as (...a: any[]) => unknown).bind(FS);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  FS['open'] = (path: string, flags: number, mode: number): unknown => {
+    try {
+      return origOpen(path, flags, mode);
+    } catch (e: unknown) {
+      // Only intercept ENOENT (44 in Emscripten) on read-only opens.
+      if (!e || (e as { errno?: number }).errno !== 44 || (flags & 3) !== 0) throw e;
+
+      const data = fetchFileSync(sab, path);
+      if (!data) throw e; // provider couldn't supply the file
+
+      ensureDirs(FS as Record<string, (...a: unknown[]) => unknown>, path);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mod as any).FS.writeFile(path, data);
+      return origOpen(path, flags, mode);
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Message handler
 // ---------------------------------------------------------------------------
 
@@ -274,10 +363,11 @@ const dispatch = makeDispatch();
 
     // Special init message: load the wasm module.
     if (req.method === 'init') {
-      const initReq = req as { id: number; method: 'init'; wasmJsUrl: string };
+      const initReq = req as { id: number; method: 'init'; wasmJsUrl: string; fileSAB: SharedArrayBuffer };
       try {
         const { default: createLLDB } = await import(initReq.wasmJsUrl);
         mod = await createLLDB() as LLDBMod;
+        installFSBridge(initReq.fileSAB);
         ccall('lldb_wasm_initialize', null, [], []);
         handle = ccall('lldb_wasm_create_debugger', 'number', [], []) as number;
         if (!handle) throw new Error('lldb_wasm_create_debugger returned 0');

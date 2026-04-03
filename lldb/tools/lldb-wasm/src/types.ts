@@ -44,3 +44,13 @@ export interface LLDBClientOptions {
   /** URL of the compiled worker script. Defaults to dist/worker.js alongside the package. */
   workerUrl?: string;
 }
+
+/**
+ * Called by LLDB when it needs to read a source file that is not already in
+ * the in-memory filesystem. Return the file's bytes, or null if unavailable.
+ *
+ * The path is whatever the DWARF debug info recorded at compile time
+ * (e.g. /home/user/project/src/main.c). Use source-map remapping or a
+ * path rewriter in your implementation as needed.
+ */
+export type FileProvider = (path: string) => Promise<Uint8Array | null>;

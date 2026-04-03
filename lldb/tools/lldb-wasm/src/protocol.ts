@@ -4,7 +4,7 @@ import type { StopReason } from './types.js';
 
 // Main thread → Worker
 export type Request =
-  | { id: number; method: 'init'; wasmJsUrl: string }
+  | { id: number; method: 'init'; wasmJsUrl: string; fileSAB: SharedArrayBuffer }
   | { id: number; method: string; args: unknown[] };
 
 // Worker → Main thread (in response to a Request)
