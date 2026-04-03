@@ -1,9 +1,35 @@
 // Worker script: loads the LLDB wasm module and handles all C API calls.
-// Runs inside a dedicated Web Worker so blocking ccall operations never
-// stall the main thread.
+// Runs inside a dedicated Web Worker (browser) or worker_threads Worker (Node).
 
 import type { Request, Response, StopEvent, ReadyMessage, ErrorMessage } from './protocol.js';
 import type { StopReason } from './types.js';
+
+// ---------------------------------------------------------------------------
+// Environment abstraction: browser Web Worker vs Node worker_threads
+// ---------------------------------------------------------------------------
+
+interface WorkerPort {
+  onMessage(handler: (data: unknown) => void): void;
+  postMessage(data: unknown): void;
+}
+
+async function getPort(): Promise<WorkerPort> {
+  // Browser DedicatedWorkerGlobalScope has self.postMessage.
+  if (typeof self !== 'undefined' && typeof (self as { postMessage?: unknown }).postMessage === 'function') {
+    const w = self as DedicatedWorkerGlobalScope;
+    return {
+      onMessage: (h) => { w.onmessage = (e: MessageEvent) => h(e.data); },
+      postMessage: (d) => w.postMessage(d),
+    };
+  }
+  // Node.js worker_threads uses parentPort.
+  const { parentPort } = await import('node:worker_threads');
+  if (!parentPort) throw new Error('not running inside a worker');
+  return {
+    onMessage: (h) => parentPort.on('message', h),
+    postMessage: (d) => parentPort.postMessage(d),
+  };
+}
 
 // Minimal interface for what we use from the Emscripten module.
 interface LLDBMod {
@@ -227,7 +253,8 @@ function checkForStop(): void {
   const reason = JSON.parse(json) as StopReason;
   if (reason.reason !== 'running') {
     const msg: StopEvent = { type: 'event', event: reason };
-    self.postMessage(msg);
+    const port = (globalThis as Record<string, unknown>).__lldbWorkerPort as WorkerPort | undefined;
+    port?.postMessage(msg);
   }
 }
 
@@ -237,44 +264,51 @@ function checkForStop(): void {
 
 const dispatch = makeDispatch();
 
-self.onmessage = async (e: MessageEvent<Request>) => {
-  const req = e.data;
+(async () => {
+  const port = await getPort();
 
-  // Special init message: load the wasm module.
-  if (req.method === 'init') {
-    const initReq = req as { id: number; method: 'init'; wasmJsUrl: string };
-    try {
-      const { default: createLLDB } = await import(initReq.wasmJsUrl);
-      mod = await createLLDB() as LLDBMod;
-      ccall('lldb_wasm_initialize', null, [], []);
-      handle = ccall('lldb_wasm_create_debugger', 'number', [], []) as number;
-      if (!handle) throw new Error('lldb_wasm_create_debugger returned 0');
-      const ready: ReadyMessage = { type: 'ready' };
-      self.postMessage(ready);
-      const res: Response = { id: initReq.id, result: undefined };
-      self.postMessage(res);
-    } catch (err) {
-      const msg: ErrorMessage = { type: 'error', message: String(err) };
-      self.postMessage(msg);
-      const res: Response = { id: initReq.id, error: String(err) };
-      self.postMessage(res);
+  port.onMessage(async (data: unknown) => {
+    const req = data as Request;
+
+    // Special init message: load the wasm module.
+    if (req.method === 'init') {
+      const initReq = req as { id: number; method: 'init'; wasmJsUrl: string };
+      try {
+        const { default: createLLDB } = await import(initReq.wasmJsUrl);
+        mod = await createLLDB() as LLDBMod;
+        ccall('lldb_wasm_initialize', null, [], []);
+        handle = ccall('lldb_wasm_create_debugger', 'number', [], []) as number;
+        if (!handle) throw new Error('lldb_wasm_create_debugger returned 0');
+        const ready: ReadyMessage = { type: 'ready' };
+        port.postMessage(ready);
+        const res: Response = { id: initReq.id, result: undefined };
+        port.postMessage(res);
+      } catch (err) {
+        const msg: ErrorMessage = { type: 'error', message: String(err) };
+        port.postMessage(msg);
+        const res: Response = { id: initReq.id, error: String(err) };
+        port.postMessage(res);
+      }
+      return;
     }
-    return;
-  }
 
-  const handler = dispatch.get(req.method);
-  if (!handler) {
-    const res: Response = { id: req.id, error: `unknown method: ${req.method}` };
-    self.postMessage(res);
-    return;
-  }
+    const handler = dispatch.get(req.method);
+    if (!handler) {
+      const res: Response = { id: req.id, error: `unknown method: ${req.method}` };
+      port.postMessage(res);
+      return;
+    }
 
-  try {
-    const result = handler((req as { args: unknown[] }).args ?? []);
-    const res: Response = { id: req.id, result };
-    self.postMessage(res);
-  } catch (err) {
-    const res: Response = { id: req.id, error: String(err) };
-    self.postMessage(res);
-  }
-};
+    try {
+      const result = handler((req as { args: unknown[] }).args ?? []);
+      const res: Response = { id: req.id, result };
+      port.postMessage(res);
+    } catch (err) {
+      const res: Response = { id: req.id, error: String(err) };
+      port.postMessage(res);
+    }
+  });
+
+  // Patch port.postMessage into the stop event emitter so checkForStop can use it.
+  (globalThis as Record<string, unknown>).__lldbWorkerPort = port;
+})();

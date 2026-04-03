@@ -19,10 +19,14 @@
     "copy-wasm": "node scripts/copy-wasm.mjs",
     "build": "npm run copy-wasm && tsc",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "@types/node": "^25.5.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.0.0"
   },
   "engines": {
     "node": ">=18"
@@ -31,6 +35,12 @@
     "type": "git",
     "url": "https://github.com/firefox-devtools/lldb-wasm"
   },
-  "keywords": ["lldb", "webassembly", "wasm", "debugger", "devtools"],
+  "keywords": [
+    "lldb",
+    "webassembly",
+    "wasm",
+    "debugger",
+    "devtools"
+  ],
   "license": "Apache-2.0"
 }

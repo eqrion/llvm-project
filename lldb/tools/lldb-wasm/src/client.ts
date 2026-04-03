@@ -13,6 +13,7 @@ export class LLDBClient {
   readonly #pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   readonly #stopListeners: Array<(r: StopReason) => void> = [];
   #nextId = 0;
+  #destroyed = false;
 
   private constructor(worker: Worker) {
     this.#worker = worker;
@@ -37,6 +38,9 @@ export class LLDBClient {
   }
 
   private call<T>(method: string, ...args: unknown[]): Promise<T> {
+    if (this.#destroyed) {
+      return Promise.reject(new Error('LLDBClient has been destroyed'));
+    }
     return new Promise<T>((resolve, reject) => {
       const id = this.#nextId++;
       this.#pending.set(id, {
@@ -57,9 +61,10 @@ export class LLDBClient {
    *   the copy bundled with this package.
    */
   static async create(options: LLDBClientOptions = {}): Promise<LLDBClient> {
-    const worker = new Worker(new URL('./worker.js', import.meta.url), {
-      type: 'module',
-    });
+    const workerUrl = options.workerUrl
+      ? new URL(options.workerUrl)
+      : new URL('./worker.js', import.meta.url);
+    const worker = new Worker(workerUrl, { type: 'module' });
 
     const client = new LLDBClient(worker);
 
@@ -223,6 +228,10 @@ export class LLDBClient {
   // -------------------------------------------------------------------------
 
   destroy(): void {
+    this.#destroyed = true;
+    const err = new Error('LLDBClient has been destroyed');
+    for (const { reject } of this.#pending.values()) reject(err);
+    this.#pending.clear();
     this.#worker.terminate();
   }
 }

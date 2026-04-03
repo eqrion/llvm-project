@@ -41,4 +41,6 @@ export type ExpressionResult =
 export interface LLDBClientOptions {
   /** URL of lldb-wasm.js (the Emscripten output). Defaults to the bundled copy. */
   wasmJsUrl?: string;
+  /** URL of the compiled worker script. Defaults to dist/worker.js alongside the package. */
+  workerUrl?: string;
 }
