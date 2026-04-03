@@ -233,6 +233,15 @@ void IRExecutionUnit::ReportSymbolLookupError(ConstString name) {
 
 void IRExecutionUnit::GetRunnableInfo(Status &error, lldb::addr_t &func_addr,
                                       lldb::addr_t &func_end) {
+#ifdef __EMSCRIPTEN__
+  func_addr = LLDB_INVALID_ADDRESS;
+  func_end = LLDB_INVALID_ADDRESS;
+  error = Status::FromErrorString(
+      "JIT code execution is not supported in the wasm LLDB client; "
+      "use frame variable instead of expression for complex queries");
+  return;
+#endif
+
   lldb::ProcessSP process_sp(GetProcessWP().lock());
 
   static std::recursive_mutex s_runnable_info_mutex;

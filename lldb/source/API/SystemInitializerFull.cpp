@@ -22,10 +22,12 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/TargetSelect.h"
 
+#ifndef __EMSCRIPTEN__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wglobal-constructors"
 #include "llvm/ExecutionEngine/MCJIT.h"
 #pragma clang diagnostic pop
+#endif
 
 #include <string>
 
@@ -43,10 +45,17 @@ llvm::Error SystemInitializerFull::Initialize() {
     return error;
 
   // Initialize LLVM and Clang
+#ifdef __EMSCRIPTEN__
+  LLVMInitializeWebAssemblyTarget();
+  LLVMInitializeWebAssemblyTargetMC();
+  LLVMInitializeWebAssemblyDisassembler();
+  LLVMInitializeWebAssemblyAsmPrinter();
+#else
   llvm::InitializeAllTargets();
   llvm::InitializeAllAsmPrinters();
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllDisassemblers();
+#endif
 
   // Initialize the command line parser in LLVM. This usually isn't necessary
   // as we aren't dealing with command line options here, but otherwise some

@@ -1,4 +1,6 @@
 set_property(DIRECTORY PROPERTY LLDB_PLUGIN_KIND UnwindAssembly)
 
-add_subdirectory(InstEmulation)
-add_subdirectory(x86)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  add_subdirectory(InstEmulation)
+  add_subdirectory(x86)
+endif()

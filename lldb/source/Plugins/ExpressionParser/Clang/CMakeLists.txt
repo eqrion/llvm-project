@@ -1,3 +1,9 @@
+if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  set(expression_parser_jit_components "")
+else()
+  set(expression_parser_jit_components ExecutionEngine MCJIT)
+endif()
+
 add_lldb_library(lldbPluginExpressionParserClang
   ASTResultSynthesizer.cpp
   ASTStructExtractor.cpp
@@ -31,9 +37,8 @@ add_lldb_library(lldbPluginExpressionParserClang
 
   LINK_COMPONENTS
     Core
-    ExecutionEngine
+    ${expression_parser_jit_components}
     ipo
-    MCJIT
     Support
     TargetParser
   LINK_LIBS

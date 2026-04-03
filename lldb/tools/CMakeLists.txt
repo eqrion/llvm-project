@@ -1,3 +1,8 @@
+if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  add_subdirectory(lldb-wasm)
+  return()
+endif()
+
 add_subdirectory(argdumper)
 add_subdirectory(driver)
 add_subdirectory(intel-features)

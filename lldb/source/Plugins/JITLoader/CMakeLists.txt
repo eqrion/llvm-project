@@ -1,4 +1,6 @@
 set_property(DIRECTORY PROPERTY LLDB_PLUGIN_KIND JITLoader)
 set_property(DIRECTORY PROPERTY LLDB_TOLERATED_PLUGIN_DEPENDENCIES ObjectFile)
 
-add_subdirectory(GDB)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  add_subdirectory(GDB)
+endif()

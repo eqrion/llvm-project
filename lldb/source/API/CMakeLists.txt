@@ -33,7 +33,13 @@ add_custom_target(lldb-sbapi-dwarf-enums
   DEPENDS ${sb_languages_file})
 set_target_properties(lldb-sbapi-dwarf-enums PROPERTIES FOLDER "LLDB/Tablegenning")
 
-add_lldb_library(liblldb SHARED ${option_framework}
+if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  set(option_lib_kind STATIC)
+else()
+  set(option_lib_kind SHARED)
+endif()
+
+add_lldb_library(liblldb ${option_lib_kind} ${option_framework}
   SBAddress.cpp
   SBAddressRange.cpp
   SBAddressRangeList.cpp
