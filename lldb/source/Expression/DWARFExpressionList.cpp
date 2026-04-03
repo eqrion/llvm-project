@@ -241,16 +241,23 @@ llvm::Expected<Value> DWARFExpressionList::Evaluate(
     expr = m_exprs.Back()->data;
   } else {
     Address pc;
+    RegisterContextSP frame_reg_ctx_sp;
     StackFrame *frame = nullptr;
     if (!reg_ctx || !reg_ctx->GetPCForSymbolication(pc)) {
       if (exe_ctx)
         frame = exe_ctx->GetFramePtr();
       if (!frame)
         return llvm::createStringError("no frame");
-      RegisterContextSP reg_ctx_sp = frame->GetRegisterContext();
-      if (!reg_ctx_sp)
+      frame_reg_ctx_sp = frame->GetRegisterContext();
+      if (!frame_reg_ctx_sp)
         return llvm::createStringError("no register context");
-      reg_ctx_sp->GetPCForSymbolication(pc);
+      frame_reg_ctx_sp->GetPCForSymbolication(pc);
+      // Use the frame's register context for expression evaluation when none
+      // was provided. This is needed for vendor-specific opcodes like
+      // DW_OP_WASM_location which call back into the register context to read
+      // virtual registers (locals, globals) via qWasmLocal/qWasmGlobal.
+      if (!reg_ctx)
+        reg_ctx = frame_reg_ctx_sp.get();
     }
 
     if (!pc.IsValid()) {
@@ -265,6 +272,17 @@ llvm::Expected<Value> DWARFExpressionList::Evaluate(
   }
   expr.GetExpressionData(data);
   reg_kind = expr.GetRegisterKind();
+  // If no register context was provided, fall back to the current frame's
+  // register context. This is required for vendor-specific DWARF opcodes like
+  // DW_OP_WASM_location, which need to call back into the register context
+  // to read wasm locals/globals via qWasmLocal/qWasmGlobal.
+  RegisterContextSP fallback_reg_ctx_sp;
+  if (!reg_ctx && exe_ctx) {
+    if (StackFrame *frame = exe_ctx->GetFramePtr()) {
+      fallback_reg_ctx_sp = frame->GetRegisterContext();
+      reg_ctx = fallback_reg_ctx_sp.get();
+    }
+  }
   return DWARFExpression::Evaluate(exe_ctx, reg_ctx, module_sp, data,
                                    m_dwarf_cu, reg_kind, initial_value_ptr,
                                    object_address_ptr);
