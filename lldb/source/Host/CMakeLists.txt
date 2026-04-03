@@ -81,6 +81,28 @@ if (CMAKE_SYSTEM_NAME MATCHES "Windows")
     windows/PseudoConsole.cpp
     windows/ProcessRunLock.cpp
     )
+
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  # Emscripten has POSIX emulation but no fork/ptrace.
+  # DomainSocket compiles (sys/un.h exists) but AF_UNIX won't work at runtime.
+  add_host_subdirectory(posix
+    posix/DomainSocket.cpp
+    posix/FileSystemPosix.cpp
+    posix/HostInfoPosix.cpp
+    posix/HostProcessPosix.cpp
+    posix/HostThreadPosix.cpp
+    posix/LockFilePosix.cpp
+    posix/MainLoopPosix.cpp
+    posix/PipePosix.cpp
+    posix/Support.cpp
+    )
+  add_host_subdirectory(emscripten
+    emscripten/ConnectionInProcess.cpp
+    emscripten/Host.cpp
+    emscripten/HostInfoEmscripten.cpp
+    emscripten/ProcessLauncherEmscripten.cpp
+    )
+
 else()
   add_host_subdirectory(posix
     posix/DomainSocket.cpp
@@ -111,7 +133,6 @@ else()
                COMPILE_DEFINITIONS "NO_XPC_SERVICES=1")
     endif()
 
-
   elseif (CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
     add_host_subdirectory(linux
       linux/AbstractSocket.cpp
@@ -125,6 +146,7 @@ else()
         android/HostInfoAndroid.cpp
         )
     endif()
+
   elseif (CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
     add_host_subdirectory(freebsd
       freebsd/Host.cpp
