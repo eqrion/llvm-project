@@ -177,6 +177,30 @@ class MyResponder(MockGDBServerResponder):
         return "E03"
 
 
+class SteppingResponder(MyResponder):
+    """A responder that cycles through a sequence of wasm call stacks as steps occur.
+
+    step_call_stacks[0] is the initial call stack; each 's' packet advances to
+    the next entry.  qWasmCallStack always returns the current entry so that
+    repeated queries within the same stop return a consistent value.
+    """
+
+    def __init__(self, obj_path, step_call_stacks):
+        self._step_idx = 0
+        self._step_call_stacks = step_call_stacks
+        super().__init__(obj_path)
+
+    def respond(self, packet):
+        if packet == "s":
+            self._step_idx = min(self._step_idx + 1, len(self._step_call_stacks) - 1)
+            return ["T05thread:1;reason:trace;"]
+        return super().respond(packet)
+
+    def qWasmCallStack(self):
+        frames = self._step_call_stacks[self._step_idx]
+        return str(WasmCallStack([WasmStackFrame(addr) for addr in frames]))
+
+
 class TestWasm(GDBRemoteTestBase):
     @skipIfAsan
     @skipIfXmlSupportMissing
@@ -376,3 +400,84 @@ class TestWasm(GDBRemoteTestBase):
         b = frame0.FindVariable("b")
         self.assertTrue(b.IsValid())
         self.assertEqual(b.GetValueAsUnsigned(), 2)
+
+    def _connect_and_stop(self, obj_path):
+        target = self.dbg.CreateTarget("")
+        process = self.connect(target, "wasm")
+        lldbutil.expect_state_changes(
+            self, self.dbg.GetListener(), process, [lldb.eStateStopped]
+        )
+        return process
+
+    def _yaml_obj(self, yaml_path):
+        yaml_base, _ = os.path.splitext(yaml_path)
+        obj_path = self.getBuildArtifact(yaml_base)
+        self.yaml2obj(yaml_path, obj_path)
+        return obj_path
+
+    @skipIfAsan
+    @skipIfXmlSupportMissing
+    def test_step_instruction_in(self):
+        """Test that StepInstruction(step_in) advances the wasm PC."""
+        obj_path = self._yaml_obj("simple.yaml")
+        self.server.responder = SteppingResponder(
+            obj_path,
+            [
+                [0x01CE],  # initial stop
+                [0x01D1],  # after step: PC moved
+            ],
+        )
+
+        process = self._connect_and_stop(obj_path)
+        thread = process.GetThreadAtIndex(0)
+        self.assertEqual(thread.GetFrameAtIndex(0).GetPC(), LOAD_ADDRESS | 0x01CE)
+
+        thread.StepInstruction(False)
+
+        self.assertEqual(thread.GetStopReason(), lldb.eStopReasonPlanComplete)
+        self.assertEqual(thread.GetFrameAtIndex(0).GetPC(), LOAD_ADDRESS | 0x01D1)
+
+    @skipIfAsan
+    @skipIfXmlSupportMissing
+    def test_step_instruction_over(self):
+        """Test that StepInstruction(step_over) skips over callees."""
+        obj_path = self._yaml_obj("simple.yaml")
+        self.server.responder = SteppingResponder(
+            obj_path,
+            [
+                [0x01CE],           # initial stop: depth=1
+                [0x01CE, 0x02A0],   # after s1: depth=2, inside callee - keep stepping
+                [0x01D1],           # after s2: depth=1, callee returned - stop
+            ],
+        )
+
+        process = self._connect_and_stop(obj_path)
+        thread = process.GetThreadAtIndex(0)
+        self.assertEqual(thread.GetFrameAtIndex(0).GetPC(), LOAD_ADDRESS | 0x01CE)
+
+        thread.StepInstruction(True)
+
+        self.assertEqual(thread.GetStopReason(), lldb.eStopReasonPlanComplete)
+        self.assertEqual(thread.GetFrameAtIndex(0).GetPC(), LOAD_ADDRESS | 0x01D1)
+
+    @skipIfAsan
+    @skipIfXmlSupportMissing
+    def test_step_out(self):
+        """Test that StepOut returns to the caller frame."""
+        obj_path = self._yaml_obj("simple.yaml")
+        self.server.responder = SteppingResponder(
+            obj_path,
+            [
+                [0x019C, 0x01E5],  # initial stop: depth=2, inside callee
+                [0x01E5],          # after step out: depth=1, back in caller
+            ],
+        )
+
+        process = self._connect_and_stop(obj_path)
+        thread = process.GetThreadAtIndex(0)
+        self.assertEqual(thread.GetFrameAtIndex(0).GetPC(), LOAD_ADDRESS | 0x019C)
+
+        thread.StepOut()
+
+        self.assertEqual(thread.GetStopReason(), lldb.eStopReasonPlanComplete)
+        self.assertEqual(thread.GetFrameAtIndex(0).GetPC(), LOAD_ADDRESS | 0x01E5)
