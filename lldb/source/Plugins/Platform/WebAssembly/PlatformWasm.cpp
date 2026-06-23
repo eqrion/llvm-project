@@ -76,6 +76,18 @@ void PlatformWasm::Initialize() {
   PluginManager::RegisterPlugin(
       GetPluginNameStatic(), GetPluginDescriptionStatic(),
       PlatformWasm::CreateInstance, PlatformWasm::DebuggerInitialize);
+
+#ifdef __EMSCRIPTEN__
+  // The wasm build has no OS host-platform plugin (Linux/macOS/etc.), so
+  // nothing would otherwise call SetHostPlatform and
+  // Platform::GetHostPlatform() stays null. The debugger appends that null to
+  // its platform list (Debugger.cpp) and later crashes dereferencing it (e.g.
+  // Process::CompleteAttach -> PlatformList::GetOrCreate). Use the wasm
+  // platform as the host so the list always has a valid, wasm-compatible entry.
+  if (!Platform::GetHostPlatform())
+    Platform::SetHostPlatform(
+        PlatformWasm::CreateInstance(/*force=*/true, /*arch=*/nullptr));
+#endif
 }
 
 void PlatformWasm::Terminate() {
