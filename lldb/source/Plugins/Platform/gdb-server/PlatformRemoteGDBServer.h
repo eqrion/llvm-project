@@ -183,6 +183,12 @@ protected:
   virtual std::string MakeUrl(const char *scheme, const char *hostname,
                               uint16_t port, const char *path);
 
+  // Create the connection used for the platform's GDB-remote client. The
+  // default opens a socket via ConnectionFileDescriptor; subclasses may return
+  // a different transport based on the URL.
+  virtual std::unique_ptr<Connection>
+  CreatePlatformConnection(llvm::StringRef url);
+
   virtual llvm::StringRef GetDefaultProcessPluginName() const {
     return "gdb-remote";
   }
