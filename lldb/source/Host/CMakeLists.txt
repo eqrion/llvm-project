@@ -101,6 +101,7 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     emscripten/Host.cpp
     emscripten/HostInfoEmscripten.cpp
     emscripten/ProcessLauncherEmscripten.cpp
+    emscripten/WasmConsole.cpp
     )
 
 else()

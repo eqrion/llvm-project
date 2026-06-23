@@ -34,6 +34,14 @@ export interface CommandResult {
   status: number;
 }
 
+export interface SessionVariable {
+  valid: boolean;
+  value?: string;
+  type?: string;
+  unsigned?: number;
+  signed?: number;
+}
+
 export type ExpressionResult =
   | { value: string; type: string; error?: never }
   | { error: string; value?: never; type?: never };

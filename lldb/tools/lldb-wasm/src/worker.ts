@@ -1,7 +1,10 @@
 // Worker script: loads the LLDB wasm module and handles all C API calls.
 // Runs inside a dedicated Web Worker (browser) or worker_threads Worker (Node).
 
-import type { Request, Response, StopEvent, ReadyMessage, ErrorMessage } from './protocol.js';
+import type {
+  Request, Response, StopEvent, OutputEvent, InterpreterExitEvent,
+  ChannelDataEvent, SessionResultEvent, ReadyMessage, ErrorMessage,
+} from './protocol.js';
 import type { StopReason } from './types.js';
 import {
   SAB_STATUS_IDX, SAB_PATH_LEN_IDX, SAB_PATH_OFFSET, SAB_MAX_PATH,
@@ -195,6 +198,27 @@ function makeDispatch(): Map<string, Handler> {
     return JSON.parse(getAndFreeString(ptr));
   });
 
+  d.set('runInterpreter', () => {
+    ccall('lldb_wasm_run_command_interpreter', null, ['number'], [handle]);
+    startConsoleDrain();
+  });
+
+  d.set('consoleStdinWrite', ([data]: unknown[]) => {
+    const bytes = data as number[];
+    const buf = mod._malloc(bytes.length);
+    mod.HEAPU8.set(bytes, buf);
+    try {
+      ccall('lldb_wasm_console_stdin_write', 'number',
+        ['number', 'number'], [buf, bytes.length]);
+    } finally {
+      mod._free(buf);
+    }
+  });
+
+  d.set('consoleStdinClose', () => {
+    ccall('lldb_wasm_console_stdin_close', null, [], []);
+  });
+
   d.set('createChannel', () =>
     ccall('lldb_wasm_create_channel', 'number', [], []));
 
@@ -230,7 +254,41 @@ function makeDispatch(): Map<string, Handler> {
   });
 
   d.set('destroyChannel', ([channelId]: unknown[]) => {
+    bridgedChannels.delete(channelId as number);
     ccall('lldb_wasm_destroy_channel', null, ['number'], [channelId]);
+  });
+
+  // Start/stop draining a channel's server side. While bridged, bytes LLDB
+  // writes are drained (non-blocking) on the drain timer and pushed to the main
+  // thread as 'channelData' events, which the embedder forwards to its socket.
+  d.set('bridgeChannelStart', ([channelId]: unknown[]) => {
+    bridgedChannels.add(channelId as number);
+    ensureDrainTimer();
+  });
+
+  d.set('bridgeChannelStop', ([channelId]: unknown[]) => {
+    bridgedChannels.delete(channelId as number);
+  });
+
+  // Session ops: submit to the off-worker session thread (non-blocking). The
+  // result arrives later via the drain timer as a 'sessionResult' event.
+  d.set('sessionCommand', ([sessionId, cmd]: unknown[]) => {
+    ensureDrainTimer();
+    ccall('lldb_wasm_session_command', null,
+      ['number', 'number', 'string'], [sessionId, handle, cmd]);
+  });
+  d.set('sessionState', ([sessionId]: unknown[]) => {
+    ensureDrainTimer();
+    ccall('lldb_wasm_session_state', null, ['number', 'number'], [sessionId, handle]);
+  });
+  d.set('sessionFrames', ([sessionId]: unknown[]) => {
+    ensureDrainTimer();
+    ccall('lldb_wasm_session_frames', null, ['number', 'number'], [sessionId, handle]);
+  });
+  d.set('sessionVariable', ([sessionId, frameIndex, name]: unknown[]) => {
+    ensureDrainTimer();
+    ccall('lldb_wasm_session_variable', null,
+      ['number', 'number', 'number', 'string'], [sessionId, handle, frameIndex, name]);
   });
 
   return d;
@@ -249,6 +307,87 @@ function stopPoll(): void {
   if (pollTimer === null) return;
   clearInterval(pollTimer);
   pollTimer = null;
+}
+
+// ---------------------------------------------------------------------------
+// Drain timer: interpreter output + bridged channels
+// ---------------------------------------------------------------------------
+//
+// LLDB's interpreter REPL and GDB-remote threads write to in-process channels
+// from their own pthreads. We drain those channels NON-BLOCKING on a timer and
+// push bytes to the main thread; the worker thread never blocks, so it stays
+// free to service stdin writes and channelServerWrite (incoming RSP). One timer
+// services the interactive console and every bridged channel.
+
+let drainTimer: ReturnType<typeof setInterval> | null = null;
+let drainBuf = 0;
+let sessionBuf = 0;
+let sessionLenPtr = 0;
+let interpreterDraining = false;
+const bridgedChannels = new Set<number>();
+const DRAIN_BUF_SIZE = 16384;
+const SESSION_BUF_SIZE = 1 << 16;
+const sessionDecoder = new TextDecoder();
+
+function port(): WorkerPort | undefined {
+  return (globalThis as Record<string, unknown>).__lldbWorkerPort as WorkerPort | undefined;
+}
+
+function drainConsole(p: WorkerPort | undefined): void {
+  for (;;) {
+    const n = ccall('lldb_wasm_console_stdout_read', 'number',
+      ['number', 'number'], [drainBuf, DRAIN_BUF_SIZE]) as number;
+    if (n <= 0) break;
+    p?.postMessage({ type: 'output', data: Array.from(mod.HEAPU8.subarray(drainBuf, drainBuf + n)) } as OutputEvent);
+    if (n < DRAIN_BUF_SIZE) break;
+  }
+}
+
+function drainChannel(channelId: number, p: WorkerPort | undefined): void {
+  for (;;) {
+    const n = ccall('lldb_wasm_channel_server_read', 'number',
+      ['number', 'number', 'number', 'number'],
+      [channelId, drainBuf, DRAIN_BUF_SIZE, 0]) as number;
+    if (n <= 0) break;
+    p?.postMessage({ type: 'channelData', channelId, data: Array.from(mod.HEAPU8.subarray(drainBuf, drainBuf + n)) } as ChannelDataEvent);
+    if (n < DRAIN_BUF_SIZE) break;
+  }
+}
+
+function drainSession(p: WorkerPort | undefined): void {
+  for (;;) {
+    const id = ccall('lldb_wasm_session_poll', 'number',
+      ['number', 'number', 'number'], [sessionBuf, SESSION_BUF_SIZE, sessionLenPtr]) as number;
+    if (id === 0) break;
+    const len = mod.HEAPU32[sessionLenPtr >> 2] ?? 0;
+    const json = sessionDecoder.decode(mod.HEAPU8.subarray(sessionBuf, sessionBuf + len));
+    p?.postMessage({ type: 'sessionResult', id, json } as SessionResultEvent);
+  }
+}
+
+function ensureDrainTimer(): void {
+  if (drainTimer !== null) return;
+  if (!drainBuf) drainBuf = mod._malloc(DRAIN_BUF_SIZE);
+  if (!sessionBuf) sessionBuf = mod._malloc(SESSION_BUF_SIZE);
+  if (!sessionLenPtr) sessionLenPtr = mod._malloc(4);
+  drainTimer = setInterval(() => {
+    const p = port();
+    if (interpreterDraining) {
+      drainConsole(p);
+      if (ccall('lldb_wasm_console_interpreter_finished', 'number', [], []) as number) {
+        drainConsole(p); // flush output emitted just before exit
+        interpreterDraining = false;
+        p?.postMessage({ type: 'interpreterExit' } as InterpreterExitEvent);
+      }
+    }
+    for (const id of bridgedChannels) drainChannel(id, p);
+    drainSession(p);
+  }, 1);
+}
+
+function startConsoleDrain(): void {
+  interpreterDraining = true;
+  ensureDrainTimer();
 }
 
 function checkForStop(): void {

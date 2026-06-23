@@ -12,16 +12,19 @@
 // are prefixed with lldb_wasm_ and declared with EMSCRIPTEN_KEEPALIVE so they
 // survive dead-code elimination and appear in EXPORTED_FUNCTIONS.
 //
-// Threading model: LLDB's event loop blocks on internal mutexes, which is
-// incompatible with the JS main thread. This module is built with
-// -sPROXY_TO_PTHREAD so main() runs on a worker thread, and all exported
-// functions can block safely. JS callers use Atomics.waitAsync or a postMessage
-// bridge to receive results asynchronously.
+// Threading model: the module runs inside a dedicated JS Worker (the npm
+// package's worker.ts). That Worker owns the Emscripten filesystem and proxies
+// FS syscalls for every pthread, so it must never block. LLDB's own threads
+// (GDB-remote reader, event handler, the interactive interpreter) are pthreads
+// that may block freely. The interactive interpreter therefore reads stdin from
+// an in-process channel (see WasmConsole) rather than the proxied FS/TTY layer,
+// keeping the Worker responsive to pump the GDB-remote transport.
 //
 //===----------------------------------------------------------------------===//
 
 #include "lldb/API/SBBreakpoint.h"
 #include "lldb/API/SBCommandInterpreter.h"
+#include "lldb/API/SBCommandInterpreterRunOptions.h"
 #include "lldb/API/SBCommandReturnObject.h"
 #include "lldb/API/SBDebugger.h"
 #include "lldb/API/SBEvent.h"
@@ -34,16 +37,105 @@
 #include "lldb/API/SBThread.h"
 #include "lldb/API/SBUnixSignals.h"
 #include "lldb/API/SBValue.h"
+#include "lldb/Host/emscripten/ConnectionInProcess.h"
+#include "lldb/Host/emscripten/WasmConsole.h"
 #include "lldb/Utility/Connection.h"
 #include "lldb/Utility/Timeout.h"
-#include "InProcessChannel.h"
 
+#include <atomic>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <emscripten.h>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
+#include <utility>
+
+// ---------------------------------------------------------------------------
+// Off-worker session
+// ---------------------------------------------------------------------------
+//
+// SB API calls that drive the debug session (connect, attach, continue, step,
+// frame/variable queries) do blocking GDB-remote round-trips. They must NOT run
+// on the JS worker thread: the worker pumps the transport bridge, so blocking
+// it would deadlock the very round-trip we are waiting on. Instead the worker
+// submits an operation (non-blocking) and the session pthread runs it, blocking
+// freely while the worker stays responsive. Results are polled back by id.
+namespace {
+
+class Session {
+public:
+  void Submit(uint32_t id, std::function<std::string()> fn) {
+    EnsureStarted();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_requests.emplace(id, std::move(fn));
+    m_cv.notify_one();
+  }
+
+  // Pop one completed result. Returns its id (> 0) and fills out_json, or 0 if
+  // none are ready.
+  uint32_t Poll(std::string &out_json) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_ready.empty())
+      return 0;
+    uint32_t id = m_ready.front();
+    m_ready.pop();
+    auto it = m_results.find(id);
+    out_json = std::move(it->second);
+    m_results.erase(it);
+    return id;
+  }
+
+private:
+  void EnsureStarted() {
+    if (m_started.exchange(true))
+      return;
+    std::thread([this] { Loop(); }).detach();
+  }
+
+  void Loop() {
+    for (;;) {
+      std::pair<uint32_t, std::function<std::string()>> req;
+      {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this] { return !m_requests.empty(); });
+        req = std::move(m_requests.front());
+        m_requests.pop();
+      }
+      std::string result = req.second(); // blocking SB work; worker stays free
+      {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_results[req.first] = std::move(result);
+        m_ready.push(req.first);
+      }
+    }
+  }
+
+  std::atomic<bool> m_started{false};
+  std::mutex m_mutex;
+  std::condition_variable m_cv;
+  std::queue<std::pair<uint32_t, std::function<std::string()>>> m_requests;
+  std::map<uint32_t, std::string> m_results;
+  std::queue<uint32_t> m_ready;
+};
+
+Session g_session;
+
+// Take ownership of a malloc'd C string (from an lldb_wasm_* JSON function) and
+// return it as a std::string, freeing the original.
+std::string TakeString(char *s) {
+  std::string out = s ? s : "";
+  free(s);
+  return out;
+}
+
+} // namespace
 
 // All exported C functions must be declared extern "C" and marked
 // EMSCRIPTEN_KEEPALIVE to survive Emscripten's dead-code elimination.
@@ -80,7 +172,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t lldb_wasm_create_debugger() {
 EMSCRIPTEN_KEEPALIVE void lldb_wasm_destroy_debugger(uint32_t handle) {
   if (!handle)
     return;
-  auto *d = reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
+  auto *d =
+      reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
   lldb::SBDebugger::Destroy(*d);
   delete d;
 }
@@ -99,8 +192,7 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_connect(uint32_t handle, const char *url,
 
   // Create a wasm32 target to attach the process to.
   lldb::SBError error;
-  lldb::SBTarget target =
-      d->CreateTarget("", "wasm32", "wasm", false, error);
+  lldb::SBTarget target = d->CreateTarget("", "wasm32", "wasm", false, error);
   if (!target.IsValid()) {
     if (error_buf && error_buf_len > 0) {
       snprintf(error_buf, error_buf_len, "CreateTarget: %s",
@@ -174,9 +266,8 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_attach_wasm_module(uint32_t handle,
 
 // Set a source-level breakpoint. Returns the breakpoint ID (> 0) on success,
 // or 0 on failure.
-EMSCRIPTEN_KEEPALIVE uint32_t
-lldb_wasm_set_breakpoint_by_location(uint32_t handle, const char *file,
-                                     uint32_t line) {
+EMSCRIPTEN_KEEPALIVE uint32_t lldb_wasm_set_breakpoint_by_location(
+    uint32_t handle, const char *file, uint32_t line) {
   if (!handle || !file)
     return 0;
   auto *d =
@@ -190,9 +281,8 @@ lldb_wasm_set_breakpoint_by_location(uint32_t handle, const char *file,
 
 // Set a breakpoint at a wasm virtual address. Returns the breakpoint ID.
 // Address is passed as two 32-bit halves to avoid BigInt ccall complexity.
-EMSCRIPTEN_KEEPALIVE uint32_t
-lldb_wasm_set_breakpoint_by_address(uint32_t handle, uint32_t addr_lo,
-                                    uint32_t addr_hi) {
+EMSCRIPTEN_KEEPALIVE uint32_t lldb_wasm_set_breakpoint_by_address(
+    uint32_t handle, uint32_t addr_lo, uint32_t addr_hi) {
   if (!handle)
     return 0;
   auto *d =
@@ -219,9 +309,8 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_remove_breakpoint(uint32_t handle,
 }
 
 // Enable or disable a breakpoint.
-EMSCRIPTEN_KEEPALIVE void lldb_wasm_enable_breakpoint(uint32_t handle,
-                                                      uint32_t bp_id,
-                                                      int enable) {
+EMSCRIPTEN_KEEPALIVE void
+lldb_wasm_enable_breakpoint(uint32_t handle, uint32_t bp_id, int enable) {
   if (!handle)
     return;
   auto *d =
@@ -267,7 +356,8 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_step_over(uint32_t handle) {
     return 1;
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
-  lldb::SBThread thread = d->GetSelectedTarget().GetProcess().GetSelectedThread();
+  lldb::SBThread thread =
+      d->GetSelectedTarget().GetProcess().GetSelectedThread();
   if (!thread.IsValid())
     return 1;
   thread.StepOver();
@@ -280,7 +370,8 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_step_into(uint32_t handle) {
     return 1;
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
-  lldb::SBThread thread = d->GetSelectedTarget().GetProcess().GetSelectedThread();
+  lldb::SBThread thread =
+      d->GetSelectedTarget().GetProcess().GetSelectedThread();
   if (!thread.IsValid())
     return 1;
   thread.StepInto();
@@ -293,7 +384,8 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_step_out(uint32_t handle) {
     return 1;
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
-  lldb::SBThread thread = d->GetSelectedTarget().GetProcess().GetSelectedThread();
+  lldb::SBThread thread =
+      d->GetSelectedTarget().GetProcess().GetSelectedThread();
   if (!thread.IsValid())
     return 1;
   thread.StepOut();
@@ -347,8 +439,8 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_get_stop_reason(uint32_t handle) {
         break;
       case lldb::eStopReasonSignal: {
         lldb::SBUnixSignals signals = process.GetUnixSignals();
-        const char *signame = signals.GetSignalAsCString(
-            thread.GetStopReasonDataAtIndex(0));
+        const char *signame =
+            signals.GetSignalAsCString(thread.GetStopReasonDataAtIndex(0));
         result = R"({"reason":"signal","signal_name":")" +
                  std::string(signame ? signame : "unknown") +
                  R"(","thread_id":)" + std::to_string(tid) + "}";
@@ -389,7 +481,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t lldb_wasm_get_num_frames(uint32_t handle) {
     return 0;
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
-  lldb::SBThread thread = d->GetSelectedTarget().GetProcess().GetSelectedThread();
+  lldb::SBThread thread =
+      d->GetSelectedTarget().GetProcess().GetSelectedThread();
   if (!thread.IsValid())
     return 0;
   return static_cast<uint32_t>(thread.GetNumFrames());
@@ -409,7 +502,8 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_get_frame_info(uint32_t handle) {
 
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
-  lldb::SBThread thread = d->GetSelectedTarget().GetProcess().GetSelectedThread();
+  lldb::SBThread thread =
+      d->GetSelectedTarget().GetProcess().GetSelectedThread();
 
   if (!thread.IsValid()) {
     char *ret = static_cast<char *>(malloc(result.size() + 1));
@@ -444,8 +538,7 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_get_frame_info(uint32_t handle) {
         }
         result += std::string(file) + "\"";
       }
-      result +=
-          R"(,"line":)" + std::to_string(ctx.GetLineEntry().GetLine());
+      result += R"(,"line":)" + std::to_string(ctx.GetLineEntry().GetLine());
     }
 
     char pc_buf[32];
@@ -475,7 +568,8 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_get_variables_json(uint32_t handle,
 
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
-  lldb::SBThread thread = d->GetSelectedTarget().GetProcess().GetSelectedThread();
+  lldb::SBThread thread =
+      d->GetSelectedTarget().GetProcess().GetSelectedThread();
   if (!thread.IsValid()) {
     char *ret = static_cast<char *>(malloc(result.size() + 1));
     memcpy(ret, result.c_str(), result.size() + 1);
@@ -489,8 +583,8 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_get_variables_json(uint32_t handle,
     return ret;
   }
 
-  lldb::SBValueList vars =
-      frame.GetVariables(true, true, true, true); // args, locals, statics, in_scope_only
+  lldb::SBValueList vars = frame.GetVariables(
+      true, true, true, true); // args, locals, statics, in_scope_only
 
   result = "[";
   for (uint32_t i = 0; i < static_cast<uint32_t>(vars.GetSize()); ++i) {
@@ -531,11 +625,9 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_get_variables_json(uint32_t handle,
 // Read bytes from the wasm linear memory at the given virtual address.
 // Address is passed as two 32-bit halves (lo, hi).
 // Returns 0 on success; bytes_read is set to the number of bytes actually read.
-EMSCRIPTEN_KEEPALIVE int lldb_wasm_read_memory(uint32_t handle,
-                                               uint32_t addr_lo,
-                                               uint32_t addr_hi,
-                                               uint8_t *buf, uint32_t size,
-                                               uint32_t *bytes_read) {
+EMSCRIPTEN_KEEPALIVE int
+lldb_wasm_read_memory(uint32_t handle, uint32_t addr_lo, uint32_t addr_hi,
+                      uint8_t *buf, uint32_t size, uint32_t *bytes_read) {
   if (!handle || !buf || !size)
     return 1;
   auto *d =
@@ -569,7 +661,8 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_evaluate_expression(uint32_t handle,
 
   auto *d =
       reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
-  lldb::SBThread thread = d->GetSelectedTarget().GetProcess().GetSelectedThread();
+  lldb::SBThread thread =
+      d->GetSelectedTarget().GetProcess().GetSelectedThread();
 
   lldb::SBExpressionOptions opts;
   opts.SetFetchDynamicValue(lldb::eDynamicDontRunTarget);
@@ -618,7 +711,8 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_evaluate_expression(uint32_t handle,
       }
       return out;
     };
-    result = R"({"value":")" + escape(value) + R"(","type":")" + escape(type) + "\"}";
+    result = R"({"value":")" + escape(value) + R"(","type":")" + escape(type) +
+             "\"}";
   }
 
   char *ret = static_cast<char *>(malloc(result.size() + 1));
@@ -691,8 +785,9 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_channel_server_write(uint32_t channel_id,
 }
 
 // Server side: read bytes from the channel (LLDB → server).
-// Blocks for up to timeout_ms milliseconds (0 = wait forever).
-// Returns bytes read, or -1 if the channel does not exist.
+// Blocks for up to timeout_ms milliseconds; 0 means non-blocking (return
+// immediately with whatever is buffered). Returns bytes read, or -1 if the
+// channel does not exist.
 EMSCRIPTEN_KEEPALIVE int lldb_wasm_channel_server_read(uint32_t channel_id,
                                                        uint8_t *buf,
                                                        uint32_t size,
@@ -702,11 +797,8 @@ EMSCRIPTEN_KEEPALIVE int lldb_wasm_channel_server_read(uint32_t channel_id,
   if (!conn)
     return -1;
   lldb::ConnectionStatus status;
-  lldb_private::Timeout<std::micro> timeout =
-      timeout_ms > 0
-          ? lldb_private::Timeout<std::micro>(
-                std::chrono::microseconds(timeout_ms * 1000LL))
-          : lldb_private::Timeout<std::micro>(std::nullopt);
+  lldb_private::Timeout<std::micro> timeout(
+      std::chrono::microseconds(timeout_ms * 1000LL));
   return static_cast<int>(conn->Read(buf, size, timeout, status, nullptr));
 }
 
@@ -738,8 +830,7 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_run_command(uint32_t handle,
         reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
     lldb::SBCommandInterpreter interp = d->GetCommandInterpreter();
     lldb::SBCommandReturnObject result;
-    lldb::ReturnStatus status =
-        interp.HandleCommand(command, result, false);
+    lldb::ReturnStatus status = interp.HandleCommand(command, result, false);
     return_status = static_cast<int>(status);
     if (result.GetOutput())
       output_str = result.GetOutput();
@@ -752,31 +843,223 @@ EMSCRIPTEN_KEEPALIVE char *lldb_wasm_run_command(uint32_t handle,
     out.reserve(s.size());
     for (char c : s) {
       switch (c) {
-      case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n";  break;
-      case '\r': out += "\\r";  break;
-      case '\t': out += "\\t";  break;
-      default:   out += c;      break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
       }
     }
     return out;
   };
 
-  std::string result_json =
-      R"({"output":")" + escape(output_str) +
-      R"(","error":")" + escape(error_str) +
-      R"(","status":)" + std::to_string(return_status) + "}";
+  std::string result_json = R"({"output":")" + escape(output_str) +
+                            R"(","error":")" + escape(error_str) +
+                            R"(","status":)" + std::to_string(return_status) +
+                            "}";
 
   char *ret = static_cast<char *>(malloc(result_json.size() + 1));
   memcpy(ret, result_json.c_str(), result_json.size() + 1);
   return ret;
 }
 
+// ---------------------------------------------------------------------------
+// Interactive command interpreter
+// ---------------------------------------------------------------------------
+//
+// Runs the genuine LLDB command-interpreter REPL on a dedicated thread, reading
+// from / writing to the wasm console channels (see WasmConsole.h). The call
+// returns immediately so the worker thread stays free to pump the GDB-remote
+// transport and feed stdin. The REPL exits when stdin is closed (Ctrl-D) or the
+// user runs `quit`.
+
+static std::atomic<bool> g_interpreter_started{false};
+static std::atomic<bool> g_interpreter_finished{false};
+
+EMSCRIPTEN_KEEPALIVE void lldb_wasm_run_command_interpreter(uint32_t handle) {
+  if (!handle || g_interpreter_started.exchange(true))
+    return;
+
+  auto *d =
+      reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
+
+  // Synchronous mode: execution commands (continue/step/run) block until the
+  // target stops and print the stop reason themselves. This avoids LLDB's async
+  // event-handler thread, whose pthread_join hangs under Emscripten on exit.
+  // The worker thread stays free to pump the GDB-remote transport, so these
+  // waits complete normally.
+  d->SetAsync(false);
+
+  d->SetInputFile(lldb_private::wasm_console::GetInputFile());
+  d->SetOutputFile(lldb_private::wasm_console::GetOutputFile());
+  d->SetErrorFile(lldb_private::wasm_console::GetOutputFile());
+
+  std::thread([d]() {
+    lldb::SBCommandInterpreterRunOptions opts;
+    opts.SetAutoHandleEvents(false);
+    opts.SetSpawnThread(false);
+    opts.SetStopOnError(false);
+    opts.SetStopOnCrash(false);
+    d->RunCommandInterpreter(opts);
+    g_interpreter_finished.store(true);
+  }).detach();
+}
+
+// Feed bytes to the interpreter's stdin. Returns bytes written.
+EMSCRIPTEN_KEEPALIVE int lldb_wasm_console_stdin_write(const uint8_t *data,
+                                                       uint32_t len) {
+  if (!data)
+    return 0;
+  return static_cast<int>(lldb_private::wasm_console::WriteStdin(data, len));
+}
+
+// Signal end-of-input; the interpreter exits its read loop (like Ctrl-D).
+EMSCRIPTEN_KEEPALIVE void lldb_wasm_console_stdin_close() {
+  lldb_private::wasm_console::CloseStdin();
+}
+
+// Drain pending interpreter output into buf. Non-blocking. Returns bytes read.
+EMSCRIPTEN_KEEPALIVE int lldb_wasm_console_stdout_read(uint8_t *buf,
+                                                       uint32_t len) {
+  if (!buf || !len)
+    return 0;
+  return static_cast<int>(lldb_private::wasm_console::ReadStdout(buf, len));
+}
+
+// Returns 1 once the interpreter has exited (quit/EOF), else 0.
+EMSCRIPTEN_KEEPALIVE int lldb_wasm_console_interpreter_finished() {
+  return g_interpreter_finished.load() ? 1 : 0;
+}
+
+// Find a variable by name in a stack frame and return it as JSON:
+//   {"valid":true,"value":"10","type":"int","unsigned":10,"signed":10}
+//   {"valid":false}
+// Caller must free the result with lldb_wasm_free_string.
+EMSCRIPTEN_KEEPALIVE char *lldb_wasm_find_variable(uint32_t handle,
+                                                   uint32_t frame_index,
+                                                   const char *name) {
+  std::string result = R"({"valid":false})";
+  if (handle && name) {
+    auto *d =
+        reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
+    lldb::SBThread thread =
+        d->GetSelectedTarget().GetProcess().GetSelectedThread();
+    if (thread.IsValid()) {
+      lldb::SBFrame frame = thread.GetFrameAtIndex(frame_index);
+      if (frame.IsValid()) {
+        lldb::SBExpressionOptions opts;
+        opts.SetFetchDynamicValue(lldb::eDynamicDontRunTarget);
+        opts.SetTryAllThreads(false);
+        opts.SetUnwindOnError(true);
+        lldb::SBValue val = frame.EvaluateExpression(name, opts);
+        if (val.IsValid() && !val.GetError().Fail()) {
+          auto escape = [](const char *s) -> std::string {
+            std::string out;
+            for (const char *p = s ? s : ""; *p; ++p) {
+              if (*p == '"' || *p == '\\')
+                out += '\\';
+              out += *p;
+            }
+            return out;
+          };
+          result = R"({"valid":true,"value":")" + escape(val.GetValue()) +
+                   R"(","type":")" + escape(val.GetTypeName()) +
+                   R"(","unsigned":)" +
+                   std::to_string(val.GetValueAsUnsigned()) + R"(,"signed":)" +
+                   std::to_string(val.GetValueAsSigned()) + "}";
+        }
+      }
+    }
+  }
+  char *ret = static_cast<char *>(malloc(result.size() + 1));
+  memcpy(ret, result.c_str(), result.size() + 1);
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Session ops (run on the session pthread; see the Session class above)
+// ---------------------------------------------------------------------------
+//
+// Each op copies its arguments, enqueues a closure that calls the matching
+// (blocking) lldb_wasm_* function, and returns immediately. The worker drains
+// results with lldb_wasm_session_poll.
+
+EMSCRIPTEN_KEEPALIVE void lldb_wasm_session_command(uint32_t req_id,
+                                                    uint32_t handle,
+                                                    const char *command) {
+  std::string cmd = command ? command : "";
+  g_session.Submit(req_id, [handle, cmd] {
+    // Session ops run on the session pthread, so blocking is fine and desired:
+    // synchronous mode makes execution commands (continue/step) wait for the
+    // stop and report it, instead of returning "resuming" immediately.
+    auto *d =
+        reinterpret_cast<lldb::SBDebugger *>(static_cast<uintptr_t>(handle));
+    d->SetAsync(false);
+    return TakeString(lldb_wasm_run_command(handle, cmd.c_str()));
+  });
+}
+
+EMSCRIPTEN_KEEPALIVE void lldb_wasm_session_state(uint32_t req_id,
+                                                  uint32_t handle) {
+  g_session.Submit(req_id, [handle] {
+    return TakeString(lldb_wasm_get_stop_reason(handle));
+  });
+}
+
+EMSCRIPTEN_KEEPALIVE void lldb_wasm_session_frames(uint32_t req_id,
+                                                   uint32_t handle) {
+  g_session.Submit(req_id, [handle] {
+    return TakeString(lldb_wasm_get_frame_info(handle));
+  });
+}
+
+EMSCRIPTEN_KEEPALIVE void lldb_wasm_session_variable(uint32_t req_id,
+                                                     uint32_t handle,
+                                                     uint32_t frame_index,
+                                                     const char *name) {
+  std::string var = name ? name : "";
+  g_session.Submit(req_id, [handle, frame_index, var] {
+    return TakeString(
+        lldb_wasm_find_variable(handle, frame_index, var.c_str()));
+  });
+}
+
+// Drain one completed session result. Writes the result JSON into buf (up to
+// size bytes) and returns its request id, or 0 if none are ready.
+EMSCRIPTEN_KEEPALIVE uint32_t lldb_wasm_session_poll(uint8_t *buf,
+                                                     uint32_t size,
+                                                     uint32_t *out_len) {
+  std::string json;
+  uint32_t id = g_session.Poll(json);
+  if (id == 0)
+    return 0;
+  uint32_t n = static_cast<uint32_t>(json.size());
+  if (n > size)
+    n = size;
+  if (buf && n)
+    memcpy(buf, json.data(), n);
+  if (out_len)
+    *out_len = n;
+  return id;
+}
+
 } // extern "C"
 
 int main() {
-  // main() is proxied to a pthread by -sPROXY_TO_PTHREAD. Nothing to do here;
-  // the JS wrapper calls lldb_wasm_initialize() after the module is ready.
+  // Nothing to do here; the JS wrapper calls lldb_wasm_initialize() after the
+  // module is ready and drives everything through the exported functions.
   return 0;
 }

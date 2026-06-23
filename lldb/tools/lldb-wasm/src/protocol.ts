@@ -20,6 +20,32 @@ export interface StopEvent {
   event: StopReason;
 }
 
+// Worker → Main thread (unsolicited, interactive interpreter stdout/stderr)
+export interface OutputEvent {
+  type: 'output';
+  data: number[];
+}
+
+// Worker → Main thread (unsolicited, interpreter exited via quit/EOF)
+export interface InterpreterExitEvent {
+  type: 'interpreterExit';
+}
+
+// Worker → Main thread (unsolicited, bytes LLDB wrote to a bridged channel's
+// server side; the embedder forwards these to its socket/transport)
+export interface ChannelDataEvent {
+  type: 'channelData';
+  channelId: number;
+  data: number[];
+}
+
+// Worker → Main thread (a session op submitted earlier has completed)
+export interface SessionResultEvent {
+  type: 'sessionResult';
+  id: number;
+  json: string;
+}
+
 // Worker → Main thread (once wasm is loaded and LLDB is initialized)
 export interface ReadyMessage {
   type: 'ready';
@@ -30,4 +56,12 @@ export interface ErrorMessage {
   message: string;
 }
 
-export type WorkerMessage = Response | StopEvent | ReadyMessage | ErrorMessage;
+export type WorkerMessage =
+  | Response
+  | StopEvent
+  | OutputEvent
+  | InterpreterExitEvent
+  | ChannelDataEvent
+  | SessionResultEvent
+  | ReadyMessage
+  | ErrorMessage;

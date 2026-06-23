@@ -5,6 +5,7 @@ export type {
   FileProvider,
   FrameInfo,
   LLDBClientOptions,
+  SessionVariable,
   StopReason,
   Variable,
 } from './types.js';
