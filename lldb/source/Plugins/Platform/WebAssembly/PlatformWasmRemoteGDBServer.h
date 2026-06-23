@@ -20,7 +20,7 @@ public:
 
   ~PlatformWasmRemoteGDBServer() override;
 
-  virtual llvm::StringRef GetDefaultProcessPluginName() const override;
+  llvm::StringRef GetDefaultProcessPluginName() const override;
 
 private:
   PlatformWasmRemoteGDBServer(const PlatformWasmRemoteGDBServer &) = delete;

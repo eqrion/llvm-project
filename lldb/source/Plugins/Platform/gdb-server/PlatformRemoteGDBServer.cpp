@@ -36,6 +36,11 @@
 #include <mutex>
 #include <optional>
 
+#ifdef __EMSCRIPTEN__
+#include "lldb/Host/emscripten/ConnectionInProcess.h"
+#include "llvm/ADT/Twine.h"
+#endif
+
 using namespace lldb;
 using namespace lldb_private;
 using namespace lldb_private::platform_gdb_server;
@@ -239,9 +244,9 @@ Status PlatformRemoteGDBServer::ConnectRemote(Args &args) {
   client_up->SetPacketTimeout(
       process_gdb_remote::ProcessGDBRemote::GetPacketTimeout());
   client_up->SetConnection(CreatePlatformConnection(url));
-  // A factory may return an already-connected transport. Only dial the URL when
-  // the connection still needs to be opened; calling Connect() on a live
-  // connection would tear it back down.
+  // A factory may return an already-connected transport (e.g. an in-process
+  // channel). Only dial the URL when the connection still needs to be opened;
+  // calling Connect() on a live connection would tear it back down.
   if (!client_up->IsConnected())
     client_up->Connect(url, &error);
 
@@ -819,12 +824,30 @@ std::string PlatformRemoteGDBServer::MakeGdbServerUrl(
 
 std::unique_ptr<Connection>
 PlatformRemoteGDBServer::CreatePlatformConnection(llvm::StringRef url) {
+#ifdef __EMSCRIPTEN__
+  // In the wasm build there are no sockets: connections are bridged through an
+  // in-process channel identified by "inprocess://<id>" (the embedder pumps the
+  // channel to a real server). See lldb/Host/emscripten/ConnectionInProcess.h.
+  if (url.consume_front("inprocess://")) {
+    uint32_t channel_id = 0;
+    if (!url.getAsInteger(10, channel_id)) {
+      if (std::unique_ptr<Connection> conn =
+              wasm::TakeConnectionForChannel(channel_id))
+        return conn;
+    }
+  }
+#endif
   return std::make_unique<ConnectionFileDescriptor>();
 }
 
 std::string PlatformRemoteGDBServer::MakeUrl(const char *scheme,
                                              const char *hostname,
                                              uint16_t port, const char *path) {
+#ifdef __EMSCRIPTEN__
+  // The per-process "port" returned by qLaunchGDBServer is actually an
+  // in-process channel ID (the embedder bridges it); connect to it in-process.
+  return ("inprocess://" + llvm::Twine(port)).str();
+#else
   StreamString result;
   result.Printf("%s://", scheme);
   if (strlen(hostname) > 0)
@@ -835,6 +858,7 @@ std::string PlatformRemoteGDBServer::MakeUrl(const char *scheme,
   if (path)
     result.Write(path, strlen(path));
   return std::string(result.GetString());
+#endif
 }
 
 size_t PlatformRemoteGDBServer::ConnectToWaitingProcesses(Debugger &debugger,

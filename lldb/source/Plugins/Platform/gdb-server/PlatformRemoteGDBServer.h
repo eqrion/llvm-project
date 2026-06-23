@@ -185,7 +185,7 @@ protected:
 
   // Create the connection used for the platform's GDB-remote client. The
   // default opens a socket via ConnectionFileDescriptor; subclasses may return
-  // a different transport based on the URL.
+  // a different transport (e.g. an in-process channel) based on the URL.
   virtual std::unique_ptr<Connection>
   CreatePlatformConnection(llvm::StringRef url);
 
