@@ -28,7 +28,15 @@ set(LLVM_ENABLE_THREADS ON CACHE BOOL "")
 set(LLVM_ENABLE_ZLIB OFF CACHE BOOL "")
 set(LLVM_ENABLE_ZSTD OFF CACHE BOOL "")
 set(LLVM_ENABLE_TERMINFO OFF CACHE BOOL "")
-set(LLVM_ENABLE_LIBXML2 OFF CACHE BOOL "")
+# libxml2 is required for LLDB's gdb-remote module loading (qXfer:libraries) and
+# register definitions (target.xml). Build it for wasm with `just build-libxml2`
+# (emcmake) into build-libxml2/install and point LLVM/LLDB at the static lib.
+get_filename_component(_repo_root "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set(LIBXML2_INCLUDE_DIR "${_repo_root}/build-libxml2/install/include/libxml2"
+    CACHE PATH "")
+set(LIBXML2_LIBRARY "${_repo_root}/build-libxml2/install/lib/libxml2.a"
+    CACHE FILEPATH "")
+set(LLVM_ENABLE_LIBXML2 ON CACHE BOOL "")
 set(LLVM_ENABLE_LIBEDIT OFF CACHE BOOL "")
 set(LLVM_ENABLE_CURL OFF CACHE BOOL "")
 set(LLVM_ENABLE_HTTPLIB OFF CACHE BOOL "")
@@ -51,7 +59,7 @@ set(LLDB_ENABLE_LUA OFF CACHE BOOL "")
 set(LLDB_ENABLE_CURSES OFF CACHE BOOL "")
 set(LLDB_ENABLE_LIBEDIT OFF CACHE BOOL "")
 set(LLDB_ENABLE_LZMA OFF CACHE BOOL "")
-set(LLDB_ENABLE_LIBXML2 OFF CACHE BOOL "")
+set(LLDB_ENABLE_LIBXML2 ON CACHE BOOL "")
 set(LLDB_ENABLE_TREESITTER OFF CACHE BOOL "")
 set(LLDB_ENABLE_PROTOCOL_SERVERS OFF CACHE BOOL "")
 set(LLDB_INCLUDE_TESTS OFF CACHE BOOL "")
