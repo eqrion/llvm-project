@@ -75,6 +75,11 @@ test: npm-build
 npm-pack: npm-build
     cd {{pkg}} && npm pack
 
+# Full build + publish to npm. Runs build-all, then assembles and publishes the
+# npm package. Requires `npm login` as the eqrion user beforehand.
+publish: build-all npm-build
+    cd {{pkg}} && npm publish
+
 # Remove the wasm build directory.
 clean-wasm:
     rm -rf {{build_wasm}}

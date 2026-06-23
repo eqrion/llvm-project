@@ -1,7 +1,7 @@
 {
-  "name": "@firefox-devtools/lldb-wasm",
+  "name": "lldb-wasm",
   "version": "0.1.0",
-  "description": "LLDB compiled to WebAssembly for wasm debugging in Firefox DevTools",
+  "description": "LLDB compiled to WebAssembly for debugging wasm modules in browsers and Node.js",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -33,7 +33,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/firefox-devtools/lldb-wasm"
+    "url": "git+https://github.com/eqrion/llvm-project.git",
+    "directory": "lldb/tools/lldb-wasm"
   },
   "keywords": [
     "lldb",
