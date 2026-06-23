@@ -238,8 +238,12 @@ Status PlatformRemoteGDBServer::ConnectRemote(Args &args) {
       std::make_unique<process_gdb_remote::GDBRemoteCommunicationClient>();
   client_up->SetPacketTimeout(
       process_gdb_remote::ProcessGDBRemote::GetPacketTimeout());
-  client_up->SetConnection(std::make_unique<ConnectionFileDescriptor>());
-  client_up->Connect(url, &error);
+  client_up->SetConnection(CreatePlatformConnection(url));
+  // A factory may return an already-connected transport. Only dial the URL when
+  // the connection still needs to be opened; calling Connect() on a live
+  // connection would tear it back down.
+  if (!client_up->IsConnected())
+    client_up->Connect(url, &error);
 
   if (error.Fail())
     return error;
@@ -811,6 +815,11 @@ std::string PlatformRemoteGDBServer::MakeGdbServerUrl(
                  override_hostname ? override_hostname
                                    : platform_hostname.c_str(),
                  port + port_offset, socket_name);
+}
+
+std::unique_ptr<Connection>
+PlatformRemoteGDBServer::CreatePlatformConnection(llvm::StringRef url) {
+  return std::make_unique<ConnectionFileDescriptor>();
 }
 
 std::string PlatformRemoteGDBServer::MakeUrl(const char *scheme,
