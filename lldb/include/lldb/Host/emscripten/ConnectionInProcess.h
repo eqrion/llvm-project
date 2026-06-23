@@ -83,6 +83,31 @@ private:
   bool m_connected = false;
 };
 
+// Registry of in-process channels, keyed by an integer ID encoded in the
+// "inprocess://<id>" connect URL. JS (or an in-wasm GDB server) creates a
+// channel and exposes its server endpoint; LLDB claims the client endpoint when
+// it connects. Used by both ProcessWasm (process connection) and
+// PlatformWasmRemoteGDBServer (platform connection).
+namespace wasm {
+
+/// Create a bidirectional in-process channel. Returns a channel ID > 0. Both
+/// endpoints are held in the registry until claimed or destroyed.
+uint32_t CreateInProcessChannel();
+
+/// Claim the LLDB-side connection for a channel. Transfers ownership out of the
+/// registry; subsequent calls with the same ID return nullptr.
+std::unique_ptr<Connection> TakeConnectionForChannel(uint32_t channel_id);
+
+/// Return the server-side connection without transferring ownership, for
+/// exchanging GDB RSP packets with LLDB. Returns nullptr if the channel does
+/// not exist.
+Connection *GetServerConnection(uint32_t channel_id);
+
+/// Release a channel and both of its connections.
+void DestroyInProcessChannel(uint32_t channel_id);
+
+} // namespace wasm
+
 } // namespace lldb_private
 
 #endif // LLDB_HOST_EMSCRIPTEN_CONNECTIONINPROCESS_H

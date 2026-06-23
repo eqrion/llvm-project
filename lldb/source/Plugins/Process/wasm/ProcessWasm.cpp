@@ -7,11 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "ProcessWasm.h"
-#include "InProcessChannel.h"
 #include "ThreadWasm.h"
 #include "lldb/Core/Module.h"
 #include "lldb/Core/PluginManager.h"
 #include "lldb/Core/Value.h"
+#include "lldb/Host/emscripten/ConnectionInProcess.h"
 #include "lldb/Utility/DataBufferHeap.h"
 #include "lldb/Utility/Status.h"
 
@@ -64,8 +64,10 @@ lldb::ProcessSP ProcessWasm::CreateInstance(lldb::TargetSP target_sp,
 }
 
 Status ProcessWasm::DoConnectRemote(llvm::StringRef remote_url) {
-  // Handle the inprocess:// scheme used when the GDB server runs in the same
-  // wasm module. "inprocess://42" means channel ID 42.
+  // Handle the inprocess:// scheme: the GDB server is reached through an
+  // in-process channel instead of a socket (it may live in this wasm module or
+  // be bridged by the JS host to an external server). "inprocess://42" means
+  // channel ID 42.
   if (remote_url.starts_with("inprocess://")) {
     llvm::StringRef id_str = remote_url.drop_front(strlen("inprocess://"));
     uint32_t channel_id = 0;

@@ -1,5 +1,4 @@
 add_lldb_library(lldbPluginProcessWasm PLUGIN
-  InProcessChannel.cpp
   ProcessWasm.cpp
   RegisterContextWasm.cpp
   ThreadWasm.cpp
@@ -7,6 +6,7 @@ add_lldb_library(lldbPluginProcessWasm PLUGIN
 
   LINK_LIBS
     lldbCore
+    lldbHost
   LINK_COMPONENTS
     Support
   )

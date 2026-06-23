@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <mutex>
 
 using namespace lldb;
 using namespace lldb_private;
@@ -30,8 +32,8 @@ size_t InProcessChannel::Write(const void *src, size_t len) {
 }
 
 size_t InProcessChannel::Read(void *dst, size_t len,
-                               const Timeout<std::micro> &timeout,
-                               ConnectionStatus &status) {
+                              const Timeout<std::micro> &timeout,
+                              ConnectionStatus &status) {
   std::unique_lock<std::mutex> lock(mutex);
 
   auto wait_for_data = [this]() { return !buffer.empty() || closed; };
@@ -65,9 +67,7 @@ void InProcessChannel::Close() {
   cv.notify_all();
 }
 
-void InProcessChannel::Interrupt() {
-  cv.notify_all();
-}
+void InProcessChannel::Interrupt() { cv.notify_all(); }
 
 // ConnectionInProcess
 
@@ -78,8 +78,10 @@ ConnectionInProcess::ConnectionInProcess(std::shared_ptr<InProcessChannel> rx,
 std::pair<std::unique_ptr<ConnectionInProcess>,
           std::unique_ptr<ConnectionInProcess>>
 ConnectionInProcess::CreatePair() {
-  auto ch_a = std::make_shared<InProcessChannel>(); // client reads, server writes
-  auto ch_b = std::make_shared<InProcessChannel>(); // server reads, client writes
+  auto ch_a =
+      std::make_shared<InProcessChannel>(); // client reads, server writes
+  auto ch_b =
+      std::make_shared<InProcessChannel>(); // server reads, client writes
   return {
       std::unique_ptr<ConnectionInProcess>(new ConnectionInProcess(ch_a, ch_b)),
       std::unique_ptr<ConnectionInProcess>(new ConnectionInProcess(ch_b, ch_a)),
@@ -116,8 +118,7 @@ size_t ConnectionInProcess::Read(void *dst, size_t dst_len,
 }
 
 size_t ConnectionInProcess::Write(const void *src, size_t src_len,
-                                  ConnectionStatus &status,
-                                  Status *error_ptr) {
+                                  ConnectionStatus &status, Status *error_ptr) {
   if (!m_connected) {
     status = eConnectionStatusNoConnection;
     return 0;
@@ -134,4 +135,49 @@ bool ConnectionInProcess::InterruptRead() {
 
 std::string ConnectionInProcess::GetURI() {
   return m_connected ? "inprocess://" : "";
+}
+
+// Channel registry
+
+namespace {
+
+struct ChannelEntry {
+  std::unique_ptr<ConnectionInProcess> lldb_side;
+  std::unique_ptr<ConnectionInProcess> server_side;
+};
+
+std::mutex g_mutex;
+uint32_t g_next_id = 1;
+std::map<uint32_t, ChannelEntry> g_channels;
+
+} // namespace
+
+uint32_t lldb_private::wasm::CreateInProcessChannel() {
+  auto [lldb_end, server_end] = ConnectionInProcess::CreatePair();
+  std::lock_guard<std::mutex> lock(g_mutex);
+  uint32_t id = g_next_id++;
+  g_channels[id] = {std::move(lldb_end), std::move(server_end)};
+  return id;
+}
+
+std::unique_ptr<Connection>
+lldb_private::wasm::TakeConnectionForChannel(uint32_t channel_id) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_channels.find(channel_id);
+  if (it == g_channels.end())
+    return nullptr;
+  return std::move(it->second.lldb_side);
+}
+
+Connection *lldb_private::wasm::GetServerConnection(uint32_t channel_id) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_channels.find(channel_id);
+  if (it == g_channels.end())
+    return nullptr;
+  return it->second.server_side.get();
+}
+
+void lldb_private::wasm::DestroyInProcessChannel(uint32_t channel_id) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_channels.erase(channel_id);
 }
