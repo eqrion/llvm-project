@@ -466,25 +466,43 @@ function installFSBridge(sab: SharedArrayBuffer): void {
   const FS = (mod as any).FS as Record<string, unknown> | undefined;
   if (!FS || typeof FS['open'] !== 'function') return;
 
+  // Paths whose fetch returned null — skip re-requesting them.
+  const notFound = new Set<string>();
+
+  // Ensure path is in MEMFS, fetching from the provider if needed. Called
+  // before stat and open so LLDB's existence check populates the file first.
+  const ensure = (path: string): void => {
+    if (!path || !path.startsWith('/') || notFound.has(path)) return;
+    try {
+      (FS['lookupPath'] as (p: string) => unknown)(path);
+      return; // already in MEMFS
+    } catch (e: unknown) {
+      if (!e || (e as { errno?: number }).errno !== 44) return; // not ENOENT
+    }
+    const data = fetchFileSync(sab, path);
+    if (!data) { notFound.add(path); return; }
+    ensureDirs(FS as Record<string, (...a: unknown[]) => unknown>, path);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mod as any).FS.writeFile(path, data);
+  };
+
+  // Intercept stat so LLDB's existence check populates the file before open.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const origStat = (FS['stat'] as ((...a: any[]) => unknown) | undefined)?.bind(FS);
+  if (origStat) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    FS['stat'] = (path: string, dontFollow: unknown): unknown => {
+      ensure(path);
+      return origStat(path, dontFollow);
+    };
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const origOpen = (FS['open'] as (...a: any[]) => unknown).bind(FS);
-
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   FS['open'] = (path: string, flags: number, mode: number): unknown => {
-    try {
-      return origOpen(path, flags, mode);
-    } catch (e: unknown) {
-      // Only intercept ENOENT (44 in Emscripten) on read-only opens.
-      if (!e || (e as { errno?: number }).errno !== 44 || (flags & 3) !== 0) throw e;
-
-      const data = fetchFileSync(sab, path);
-      if (!data) throw e; // provider couldn't supply the file
-
-      ensureDirs(FS as Record<string, (...a: unknown[]) => unknown>, path);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (mod as any).FS.writeFile(path, data);
-      return origOpen(path, flags, mode);
-    }
+    if ((flags & 3) === 0) ensure(path); // read-only opens
+    return origOpen(path, flags, mode);
   };
 }
 
