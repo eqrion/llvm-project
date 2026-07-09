@@ -11,8 +11,11 @@
 #include "ProcessWasm.h"
 #include "RegisterContextWasm.h"
 #include "UnwindWasm.h"
+#include "lldb/Symbol/LineEntry.h"
+#include "lldb/Symbol/SymbolContext.h"
 #include "lldb/Target/Process.h"
 #include "lldb/Target/RegisterContext.h"
+#include "lldb/Target/StackFrame.h"
 #include "lldb/Target/StopInfo.h"
 #include "lldb/Target/Target.h"
 #include "lldb/Target/ThreadPlan.h"
@@ -35,10 +38,23 @@ using namespace lldb_private::wasm;
 //   - On WillResume: voting YES for a single-step (vCont;s).
 //   - On each stop: querying qWasmCallStack to decide whether to continue.
 //
+// StepIn/StepOver also record the source (file, line) at the starting frame.
+// A single source line commonly compiles to several wasm instructions, and
+// the compiler may emit them as multiple, non-contiguous line-table rows all
+// tagged with that same line (so a static address range captured once at the
+// start can undercount). Comparing the resolved line at each stop — the same
+// way native LLDB's step plans re-check "is this still the same source line"
+// after leaving their initial range — means ShouldStop keeps single-stepping
+// (vCont;s) while still on the starting line at the starting depth, and only
+// reports a real stop once the line changes or the call depth changes.
+// Without this, "step" stops after the very first wasm instruction, turning
+// it into "step instruction" in disguise.
+//
 // Modes
-//   kStepIn  : stop as soon as the top-frame PC changes.
-//   kStepOver: stop when the top-frame PC changes AND the stack depth has not
-//              grown (i.e. we have not stepped into a callee).
+//   kStepIn  : stop once the source line changes at the starting depth, or as
+//              soon as the depth changes (entered/left a call).
+//   kStepOver: like kStepIn, but a deeper stack (stepped into a callee) is
+//              always run to completion rather than stopped in.
 //   kStepOut : stop when the stack depth decreases below the start depth.
 // ---------------------------------------------------------------------------
 namespace {
@@ -46,14 +62,27 @@ enum class WasmStepMode { StepIn, StepOver, StepOut };
 
 class ThreadPlanWasmStep : public ThreadPlan {
 public:
-  ThreadPlanWasmStep(Thread &thread, WasmStepMode mode)
+  // `line_granularity` distinguishes the source-level step commands (step
+  // in/over a line, which should keep going until the line actually changes)
+  // from a raw single-instruction step (which must always stop after exactly
+  // one instruction, regardless of whether that instruction is still on the
+  // same source line).
+  ThreadPlanWasmStep(Thread &thread, WasmStepMode mode, bool line_granularity)
       : ThreadPlan(ThreadPlan::eKindGeneric, "wasm step", thread,
                    eVoteYes, eVoteNoOpinion),
-        m_mode(mode) {
+        m_mode(mode), m_line_granularity(line_granularity) {
     auto cs = GetWasmCallStack();
     if (cs) {
       m_start_depth = cs->size();
       m_start_pc = cs->empty() ? 0 : (*cs)[0];
+    }
+    if (m_line_granularity) {
+      const LineEntry &line_entry = CurrentLineEntry();
+      if (line_entry.IsValid()) {
+        m_start_line = line_entry.line;
+        m_start_file = line_entry.GetFile();
+        m_has_line = true;
+      }
     }
   }
 
@@ -91,14 +120,19 @@ public:
 
     size_t depth = cs->size();
     addr_t pc = (*cs)[0];
+    bool still_on_line = depth == m_start_depth && SameStartLine();
 
     bool should_stop = false;
     switch (m_mode) {
     case WasmStepMode::StepIn:
+      if (still_on_line)
+        return false;
       should_stop = (pc != m_start_pc);
       break;
     case WasmStepMode::StepOver:
       if (depth > m_start_depth)
+        return false;
+      if (still_on_line)
         return false;
       should_stop = (pc != m_start_pc);
       break;
@@ -130,9 +164,29 @@ private:
     return llvm::createStringError("no process");
   }
 
+  const LineEntry &CurrentLineEntry() {
+    static LineEntry invalid;
+    StackFrameSP frame = GetThread().GetStackFrameAtIndex(0);
+    if (!frame)
+      return invalid;
+    return frame->GetSymbolContext(eSymbolContextLineEntry).line_entry;
+  }
+
+  bool SameStartLine() {
+    if (!m_has_line)
+      return false;
+    const LineEntry &line_entry = CurrentLineEntry();
+    return line_entry.IsValid() && line_entry.line == m_start_line &&
+           line_entry.GetFile() == m_start_file;
+  }
+
   WasmStepMode m_mode;
+  bool m_line_granularity;
   size_t m_start_depth = 0;
   addr_t m_start_pc = 0;
+  uint32_t m_start_line = 0;
+  FileSpec m_start_file;
+  bool m_has_line = false;
 };
 } // namespace
 
@@ -186,8 +240,10 @@ ThreadWasm::CreateRegisterContextForFrame(StackFrame *frame) {
 }
 
 static ThreadPlanSP MakeWasmStepPlan(Thread &thread, WasmStepMode mode,
+                                     bool line_granularity,
                                      bool abort_other_plans, Status &status) {
-  ThreadPlanSP plan = std::make_shared<ThreadPlanWasmStep>(thread, mode);
+  ThreadPlanSP plan =
+      std::make_shared<ThreadPlanWasmStep>(thread, mode, line_granularity);
   status = thread.QueueThreadPlan(plan, abort_other_plans);
   return plan;
 }
@@ -195,40 +251,46 @@ static ThreadPlanSP MakeWasmStepPlan(Thread &thread, WasmStepMode mode,
 ThreadPlanSP ThreadWasm::QueueThreadPlanForStepSingleInstruction(
     bool step_over, bool abort_other_plans, bool, Status &status) {
   auto mode = step_over ? WasmStepMode::StepOver : WasmStepMode::StepIn;
-  return MakeWasmStepPlan(*this, mode, abort_other_plans, status);
+  return MakeWasmStepPlan(*this, mode, /*line_granularity=*/false,
+                          abort_other_plans, status);
 }
 
 ThreadPlanSP ThreadWasm::QueueThreadPlanForStepInRange(
     bool abort_other_plans, const AddressRange &, const SymbolContext &,
     const char *, lldb::RunMode, Status &status, LazyBool, LazyBool) {
-  return MakeWasmStepPlan(*this, WasmStepMode::StepIn, abort_other_plans,
+  return MakeWasmStepPlan(*this, WasmStepMode::StepIn,
+                          /*line_granularity=*/true, abort_other_plans,
                           status);
 }
 
 ThreadPlanSP ThreadWasm::QueueThreadPlanForStepInRange(
     bool abort_other_plans, const LineEntry &, const SymbolContext &,
     const char *, lldb::RunMode, Status &status, LazyBool, LazyBool) {
-  return MakeWasmStepPlan(*this, WasmStepMode::StepIn, abort_other_plans,
+  return MakeWasmStepPlan(*this, WasmStepMode::StepIn,
+                          /*line_granularity=*/true, abort_other_plans,
                           status);
 }
 
 ThreadPlanSP ThreadWasm::QueueThreadPlanForStepOverRange(
     bool abort_other_plans, const AddressRange &, const SymbolContext &,
     lldb::RunMode, Status &status, LazyBool) {
-  return MakeWasmStepPlan(*this, WasmStepMode::StepOver, abort_other_plans,
+  return MakeWasmStepPlan(*this, WasmStepMode::StepOver,
+                          /*line_granularity=*/true, abort_other_plans,
                           status);
 }
 
 ThreadPlanSP ThreadWasm::QueueThreadPlanForStepOverRange(
     bool abort_other_plans, const LineEntry &, const SymbolContext &,
     lldb::RunMode, Status &status, LazyBool) {
-  return MakeWasmStepPlan(*this, WasmStepMode::StepOver, abort_other_plans,
+  return MakeWasmStepPlan(*this, WasmStepMode::StepOver,
+                          /*line_granularity=*/true, abort_other_plans,
                           status);
 }
 
 ThreadPlanSP ThreadWasm::QueueThreadPlanForStepOut(
     bool abort_other_plans, SymbolContext *, bool, bool, Vote, Vote, uint32_t,
     Status &status, LazyBool) {
-  return MakeWasmStepPlan(*this, WasmStepMode::StepOut, abort_other_plans,
+  return MakeWasmStepPlan(*this, WasmStepMode::StepOut,
+                          /*line_granularity=*/false, abort_other_plans,
                           status);
 }
