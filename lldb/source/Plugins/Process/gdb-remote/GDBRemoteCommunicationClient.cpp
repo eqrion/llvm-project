@@ -1736,13 +1736,30 @@ Status GDBRemoteCommunicationClient::GetQXferMemoryMapRegionInfo(
   Status error = LoadQXferMemoryMap();
   if (!error.Success())
     return error;
+  const MemoryRegionInfo *next_region = nullptr;
   for (const auto &map_region : m_qXfer_memory_map) {
     if (map_region.GetRange().Contains(addr)) {
       region = map_region;
       return error;
     }
+    if (map_region.GetRange().GetRangeBase() > addr &&
+        (!next_region || map_region.GetRange().GetRangeBase() <
+                             next_region->GetRange().GetRangeBase()))
+      next_region = &map_region;
   }
-  error = Status::FromErrorString("Region not found");
+
+  // qXfer:memory-map only describes mapped ranges, while Process's
+  // GetMemoryRegionInfo contract also requires successful queries for the
+  // gaps between them and for the remainder of the address space.
+  region.Clear();
+  region.GetRange().SetRangeBase(addr);
+  region.GetRange().SetRangeEnd(next_region
+                                    ? next_region->GetRange().GetRangeBase()
+                                    : LLDB_INVALID_ADDRESS);
+  region.SetReadable(MemoryRegionInfo::eNo);
+  region.SetWritable(MemoryRegionInfo::eNo);
+  region.SetExecutable(MemoryRegionInfo::eNo);
+  region.SetMapped(MemoryRegionInfo::eNo);
   return error;
 }
 

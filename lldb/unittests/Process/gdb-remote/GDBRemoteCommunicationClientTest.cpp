@@ -452,6 +452,40 @@ TEST_F(GDBRemoteCommunicationClientTest, GetMemoryRegionInfoInvalidResponse) {
   EXPECT_FALSE(result.get().Success());
 }
 
+TEST_F(GDBRemoteCommunicationClientTest, GetMemoryRegionInfoFromQXferMemoryMap) {
+  lldb_private::MemoryRegionInfo region_info;
+  std::future<Status> result = std::async(std::launch::async, [&] {
+    return client.GetMemoryRegionInfo(0x3000, region_info);
+  });
+
+  HandlePacket(server, "qMemoryRegionInfo:3000", "");
+  HandlePacket(server, testing::StartsWith("qSupported:"),
+               "qXfer:memory-map:read+");
+  HandlePacket(
+      server, testing::StartsWith("qXfer:memory-map:read::0,"),
+      R"(l<?xml version="1.0"?><memory-map>)"
+      R"(<memory type="rom" start="0x4000" length="0x1000"/>)"
+      R"(<memory type="ram" start="0x1000" length="0x1000"/>)"
+      R"(</memory-map>)");
+
+  ASSERT_TRUE(result.get().Success());
+  EXPECT_EQ(0x3000u, region_info.GetRange().GetRangeBase());
+  EXPECT_EQ(0x1000u, region_info.GetRange().GetByteSize());
+  EXPECT_EQ(lldb_private::MemoryRegionInfo::eNo, region_info.GetReadable());
+  EXPECT_EQ(lldb_private::MemoryRegionInfo::eNo, region_info.GetWritable());
+  EXPECT_EQ(lldb_private::MemoryRegionInfo::eNo, region_info.GetExecutable());
+  EXPECT_EQ(lldb_private::MemoryRegionInfo::eNo, region_info.GetMapped());
+
+  result = std::async(std::launch::async, [&] {
+    return client.GetMemoryRegionInfo(0x5000, region_info);
+  });
+
+  ASSERT_TRUE(result.get().Success());
+  EXPECT_EQ(0x5000u, region_info.GetRange().GetRangeBase());
+  EXPECT_EQ(LLDB_INVALID_ADDRESS, region_info.GetRange().GetRangeEnd());
+  EXPECT_EQ(lldb_private::MemoryRegionInfo::eNo, region_info.GetMapped());
+}
+
 TEST_F(GDBRemoteCommunicationClientTest, SendTraceSupportedPacket) {
   TraceSupportedResponse trace_type;
   std::string error_message;
