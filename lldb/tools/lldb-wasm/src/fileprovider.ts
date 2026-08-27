@@ -1,31 +1,54 @@
 // File provider bridge: SharedArrayBuffer layout and main-thread watch loop.
 //
-// When LLDB opens a source file that doesn't exist in MEMFS, the Worker's
-// FS.open patch blocks synchronously via Atomics.wait while the main thread
-// fulfills the request asynchronously through whatever I/O API is available
-// (IOUtils, fetch, etc.).
+// When LLDB opens a file that doesn't exist in MEMFS, the Worker's FS.open
+// patch blocks synchronously via Atomics.wait while the main thread fulfills
+// the request asynchronously through whatever I/O API is available (IOUtils,
+// fetch, etc.).
 //
-// SAB layout (all values little-endian):
-//   [0..3]       Int32  status:  0=idle, 1=pending, 2=ready, -1=not-found
-//   [4..7]       Int32  path byte length
-//   [8..4103]    Uint8  path (UTF-8, max 4095 bytes + NUL)
-//   [4104..4107] Int32  data byte length
-//   [4108..]     Uint8  file data (max MAX_DATA bytes)
+// Files are transferred in chunks, so the data window bounds one round trip
+// rather than the file: the worker asks for the size (OP_SIZE), then reads
+// CHUNK_BYTES at a time (OP_READ) until it has the whole file. Providers stay
+// whole-file — the watch loop holds the bytes of the file being transferred and
+// slices them per request.
+//
+// SAB layout (Int32Array indices unless noted):
+//   [0]  status: 0 idle, 1 request pending, 2 ready, -1 not found
+//   [1]  op: 0 size, 1 read
+//   [2]  path byte length
+//   [3]  read offset
+//   [4]  result: file size (OP_SIZE) or data window byte length (OP_READ)
+//   byte SAB_PATH_OFFSET.. path (UTF-8)
+//   byte SAB_DATA_OFFSET.. data window
 
-export const SAB_STATUS_IDX  = 0;         // Int32Array index
-export const SAB_PATH_LEN_IDX = 1;        // Int32Array index
-export const SAB_PATH_OFFSET  = 8;        // byte offset
-export const SAB_MAX_PATH     = 4096;     // bytes
-export const SAB_DATA_LEN_IDX = 1026;     // Int32Array index (byte offset 4104)
-export const SAB_DATA_OFFSET  = 4108;     // byte offset
-export const SAB_MAX_DATA     = 4 * 1024 * 1024; // 4 MB
-export const SAB_SIZE         = SAB_DATA_OFFSET + SAB_MAX_DATA;
+import type { FileProvider } from './types.js';
 
-export type FileProvider = (path: string) => Promise<Uint8Array | null>;
+export const SAB_STATUS_IDX   = 0;
+export const SAB_OP_IDX       = 1;
+export const SAB_PATH_LEN_IDX = 2;
+export const SAB_OFFSET_IDX   = 3;
+export const SAB_RESULT_IDX   = 4;
+
+export const STATUS_IDLE      = 0;
+export const STATUS_PENDING   = 1;
+export const STATUS_READY     = 2;
+export const STATUS_NOT_FOUND = -1;
+
+export const OP_SIZE = 0;
+export const OP_READ = 1;
+
+export const SAB_PATH_OFFSET = 32;                               // after the control words
+export const SAB_MAX_PATH    = 4096;                             // bytes
+export const SAB_DATA_OFFSET = SAB_PATH_OFFSET + SAB_MAX_PATH;
+export const SAB_CHUNK_BYTES = 4 * 1024 * 1024;                  // one round trip
+export const SAB_SIZE        = SAB_DATA_OFFSET + SAB_CHUNK_BYTES;
+
+// Sizes and offsets cross the wire as Int32, so this is the largest file the
+// bridge can carry.
+export const SAB_MAX_FILE_BYTES = 0x7fffffff;
 
 // Run on the main thread for the lifetime of an LLDBClient.
-// Watches the SAB for file read requests from the Worker and fulfills them
-// by calling the registered provider.
+// Watches the SAB for file requests from the Worker and fulfills them by
+// calling the registered provider.
 export async function watchForFileRequests(
   sab: SharedArrayBuffer,
   getProvider: () => FileProvider | null,
@@ -35,39 +58,55 @@ export async function watchForFileRequests(
   const u8  = new Uint8Array(sab);
   const dec = new TextDecoder();
 
+  // Bytes of the file currently being transferred. The worker asks for a size
+  // and then reads that file through to its end before requesting another, so
+  // holding one file is enough to serve every chunk from a single provider
+  // call.
+  let held: { path: string; bytes: Uint8Array } | null = null;
+
+  const load = async (path: string): Promise<Uint8Array | null> => {
+    if (held?.path === path) return held.bytes;
+    const provider = getProvider();
+    if (!provider) return null;
+    let bytes: Uint8Array | null = null;
+    try { bytes = await provider(path); } catch { return null; }
+    if (!bytes || bytes.byteLength > SAB_MAX_FILE_BYTES) return null;
+    held = { path, bytes };
+    return bytes;
+  };
+
   while (!destroyed()) {
-    // Wait until status is no longer 0 (idle).
-    const r = Atomics.waitAsync(i32, SAB_STATUS_IDX, 0);
+    // Wait until status is no longer idle.
+    const r = Atomics.waitAsync(i32, SAB_STATUS_IDX, STATUS_IDLE);
     if (r.async) await r.value;
 
-    const status = Atomics.load(i32, SAB_STATUS_IDX);
-    if (status !== 1) {
-      // Transitional state (2 or -1) while worker resets; spin briefly.
+    if (Atomics.load(i32, SAB_STATUS_IDX) !== STATUS_PENDING) {
+      // Transitional state while the worker consumes a response; spin briefly.
       continue;
     }
 
-    // Read the requested path.
-    const pathLen  = Atomics.load(i32, SAB_PATH_LEN_IDX);
-    const pathBytes = u8.slice(SAB_PATH_OFFSET, SAB_PATH_OFFSET + pathLen);
-    const path     = dec.decode(pathBytes);
+    const pathLen = Atomics.load(i32, SAB_PATH_LEN_IDX);
+    const path = dec.decode(u8.slice(SAB_PATH_OFFSET, SAB_PATH_OFFSET + pathLen));
+    const op = Atomics.load(i32, SAB_OP_IDX);
+    const bytes = await load(path);
 
-    // Ask the provider for the file content.
-    let data: Uint8Array | null = null;
-    const provider = getProvider();
-    if (provider) {
-      try { data = await provider(path); } catch { /* treat as not found */ }
-    }
-
-    if (data && data.byteLength <= SAB_MAX_DATA) {
-      u8.set(data, SAB_DATA_OFFSET);
-      Atomics.store(i32, SAB_DATA_LEN_IDX, data.byteLength);
-      Atomics.store(i32, SAB_STATUS_IDX, 2);   // ready
+    if (!bytes) {
+      Atomics.store(i32, SAB_STATUS_IDX, STATUS_NOT_FOUND);
     } else {
-      Atomics.store(i32, SAB_STATUS_IDX, -1);  // not found
+      let result = bytes.byteLength;
+      if (op === OP_READ) {
+        const offset = Atomics.load(i32, SAB_OFFSET_IDX);
+        const end = Math.min(offset + SAB_CHUNK_BYTES, bytes.byteLength);
+        const chunk = bytes.subarray(offset, end);
+        u8.set(chunk, SAB_DATA_OFFSET);
+        result = chunk.byteLength;
+      }
+      Atomics.store(i32, SAB_RESULT_IDX, result);
+      Atomics.store(i32, SAB_STATUS_IDX, STATUS_READY);
     }
     Atomics.notify(i32, SAB_STATUS_IDX);
 
-    // Wait for the worker to consume the response and reset status to 0.
+    // Wait for the worker to consume the response and reset status to idle.
     // This prevents the loop from spinning on the transitional state.
     await Atomics.waitAsync(i32, SAB_STATUS_IDX, Atomics.load(i32, SAB_STATUS_IDX)).value;
   }

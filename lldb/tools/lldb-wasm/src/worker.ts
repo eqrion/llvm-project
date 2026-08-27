@@ -7,8 +7,9 @@ import type {
 } from './protocol.js';
 import type { StopReason } from './types.js';
 import {
-  SAB_STATUS_IDX, SAB_PATH_LEN_IDX, SAB_PATH_OFFSET, SAB_MAX_PATH,
-  SAB_DATA_LEN_IDX, SAB_DATA_OFFSET, SAB_MAX_DATA,
+  SAB_STATUS_IDX, SAB_OP_IDX, SAB_PATH_LEN_IDX, SAB_OFFSET_IDX, SAB_RESULT_IDX,
+  SAB_PATH_OFFSET, SAB_MAX_PATH, SAB_DATA_OFFSET,
+  STATUS_IDLE, STATUS_PENDING, STATUS_READY, OP_SIZE, OP_READ,
 } from './fileprovider.js';
 
 // ---------------------------------------------------------------------------
@@ -418,36 +419,62 @@ function checkForStop(): void {
 //   - Emscripten proxies FS calls from pthreads to the main wasm worker,
 //     so blocking here does not stall LLDB's internal GDB remote threads
 
-function fetchFileSync(sab: SharedArrayBuffer, path: string): Uint8Array | null {
+// Post one request and block until the main thread answers. `consume` runs
+// while the response is still in the data window, before the window is released
+// back to the watch loop. Returns null if the host has no such file.
+function fileRequest(
+  sab: SharedArrayBuffer,
+  op: number,
+  path: string,
+  offset: number,
+  consume?: (result: number, data: Uint8Array) => void,
+): number | null {
   const i32 = new Int32Array(sab);
   const u8  = new Uint8Array(sab);
-  const enc = new TextEncoder();
 
-  const pathBytes = enc.encode(path);
+  const pathBytes = new TextEncoder().encode(path);
   if (pathBytes.byteLength > SAB_MAX_PATH) return null;
 
   u8.set(pathBytes, SAB_PATH_OFFSET);
   Atomics.store(i32, SAB_PATH_LEN_IDX, pathBytes.byteLength);
-  Atomics.store(i32, SAB_STATUS_IDX, 1);   // pending
+  Atomics.store(i32, SAB_OP_IDX, op);
+  Atomics.store(i32, SAB_OFFSET_IDX, offset);
+  Atomics.store(i32, SAB_STATUS_IDX, STATUS_PENDING);
   Atomics.notify(i32, SAB_STATUS_IDX);
 
-  // Block until the main thread responds (status changes away from 1).
-  Atomics.wait(i32, SAB_STATUS_IDX, 1);
+  // Block until the main thread responds (status changes away from pending).
+  Atomics.wait(i32, SAB_STATUS_IDX, STATUS_PENDING);
 
-  const status = Atomics.load(i32, SAB_STATUS_IDX);
-  if (status !== 2) {
-    Atomics.store(i32, SAB_STATUS_IDX, 0);
-    Atomics.notify(i32, SAB_STATUS_IDX);
-    return null; // not found
+  let result: number | null = null;
+  if (Atomics.load(i32, SAB_STATUS_IDX) === STATUS_READY) {
+    result = Atomics.load(i32, SAB_RESULT_IDX);
+    consume?.(result, u8);
   }
 
-  const dataLen = Atomics.load(i32, SAB_DATA_LEN_IDX);
-  const data = u8.slice(SAB_DATA_OFFSET, SAB_DATA_OFFSET + dataLen);
-
   // Reset to idle so the main thread's watch loop can block again.
-  Atomics.store(i32, SAB_STATUS_IDX, 0);
+  Atomics.store(i32, SAB_STATUS_IDX, STATUS_IDLE);
   Atomics.notify(i32, SAB_STATUS_IDX);
-  return data;
+  return result;
+}
+
+// Read a whole file from the host, one data window at a time. Size is asked for
+// first so the file lands in a single allocation; the host serves every chunk of
+// it from one provider call.
+function fetchFileSync(sab: SharedArrayBuffer, path: string): Uint8Array | null {
+  const size = fileRequest(sab, OP_SIZE, path, 0);
+  if (size === null) return null;
+
+  const file = new Uint8Array(size);
+  let offset = 0;
+  while (offset < size) {
+    const at = offset;
+    const read = fileRequest(sab, OP_READ, path, at, (length, data) => {
+      file.set(data.subarray(SAB_DATA_OFFSET, SAB_DATA_OFFSET + length), at);
+    });
+    if (read === null || read === 0) return null; // host lost the file mid-read
+    offset += read;
+  }
+  return file;
 }
 
 function ensureDirs(FS: Record<string, (...a: unknown[]) => unknown>, path: string): void {
