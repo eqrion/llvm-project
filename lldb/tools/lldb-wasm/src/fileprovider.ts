@@ -90,8 +90,10 @@ export async function watchForFileRequests(
     const op = Atomics.load(i32, SAB_OP_IDX);
     const bytes = await load(path);
 
+    let responseStatus: number;
     if (!bytes) {
-      Atomics.store(i32, SAB_STATUS_IDX, STATUS_NOT_FOUND);
+      responseStatus = STATUS_NOT_FOUND;
+      Atomics.store(i32, SAB_STATUS_IDX, responseStatus);
     } else {
       let result = bytes.byteLength;
       if (op === OP_READ) {
@@ -102,12 +104,17 @@ export async function watchForFileRequests(
         result = chunk.byteLength;
       }
       Atomics.store(i32, SAB_RESULT_IDX, result);
-      Atomics.store(i32, SAB_STATUS_IDX, STATUS_READY);
+      responseStatus = STATUS_READY;
+      Atomics.store(i32, SAB_STATUS_IDX, responseStatus);
     }
     Atomics.notify(i32, SAB_STATUS_IDX);
 
     // Wait for the worker to consume the response and reset status to idle.
-    // This prevents the loop from spinning on the transitional state.
-    await Atomics.waitAsync(i32, SAB_STATUS_IDX, Atomics.load(i32, SAB_STATUS_IDX)).value;
+    // Wait on the response value we published, rather than reloading status:
+    // the worker may have already advanced through idle and published its next
+    // request. In that case waitAsync returns "not-equal" immediately and the
+    // outer loop services the pending request instead of waiting on it.
+    const consumed = Atomics.waitAsync(i32, SAB_STATUS_IDX, responseStatus);
+    if (consumed.async) await consumed.value;
   }
 }

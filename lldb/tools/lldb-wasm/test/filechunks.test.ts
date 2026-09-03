@@ -11,7 +11,7 @@ import {
   watchForFileRequests,
   SAB_SIZE, SAB_CHUNK_BYTES, SAB_STATUS_IDX, SAB_OP_IDX, SAB_PATH_LEN_IDX,
   SAB_OFFSET_IDX, SAB_RESULT_IDX, SAB_PATH_OFFSET, SAB_DATA_OFFSET,
-  STATUS_IDLE, STATUS_PENDING, STATUS_READY, OP_SIZE, OP_READ,
+  STATUS_IDLE, STATUS_PENDING, STATUS_READY, STATUS_NOT_FOUND, OP_SIZE, OP_READ,
 } from '../dist/fileprovider.js';
 import type { FileProvider } from '../dist/index.js';
 
@@ -104,6 +104,80 @@ function pattern(length: number): Uint8Array {
 }
 
 describe('chunked file transfer', () => {
+  it('services a request published while the previous response is being consumed', async () => {
+    const sab = new SharedArrayBuffer(SAB_SIZE);
+    const i32 = new Int32Array(sab);
+    const u8 = new Uint8Array(sab);
+    const enc = new TextEncoder();
+    const paths: string[] = [];
+    let done = false;
+
+    const writeRequest = (path: string) => {
+      const pathBytes = enc.encode(path);
+      u8.set(pathBytes, SAB_PATH_OFFSET);
+      Atomics.store(i32, SAB_PATH_LEN_IDX, pathBytes.byteLength);
+      Atomics.store(i32, SAB_OP_IDX, OP_SIZE);
+      Atomics.store(i32, SAB_OFFSET_IDX, 0);
+      Atomics.store(i32, SAB_STATUS_IDX, STATUS_PENDING);
+    };
+
+    // Force the worker-side transition which exposed a lost wakeup in CI:
+    // consume the first response and publish the next request before the host
+    // starts waiting for response consumption. Intercepting notify makes the
+    // otherwise scheduler-dependent interleaving deterministic.
+    const originalNotify = Atomics.notify;
+    let publishedNextRequest = false;
+    Object.defineProperty(Atomics, 'notify', {
+      configurable: true,
+      writable: true,
+      value: (array: Int32Array, index: number, count?: number) => {
+        const awakened = count === undefined
+          ? originalNotify(array, index)
+          : originalNotify(array, index, count);
+        if (
+          array.buffer === sab &&
+          index === SAB_STATUS_IDX &&
+          Atomics.load(i32, SAB_STATUS_IDX) === STATUS_NOT_FOUND &&
+          !publishedNextRequest
+        ) {
+          publishedNextRequest = true;
+          Atomics.store(i32, SAB_STATUS_IDX, STATUS_IDLE);
+          writeRequest('/second-missing.bin');
+          originalNotify(i32, SAB_STATUS_IDX);
+        }
+        return awakened;
+      },
+    });
+
+    const watcher = watchForFileRequests(
+      sab,
+      () => async (path) => {
+        paths.push(path);
+        return null;
+      },
+      () => done,
+    );
+
+    try {
+      writeRequest('/first-missing.bin');
+      originalNotify(i32, SAB_STATUS_IDX);
+      await expect.poll(() => paths, { timeout: 1_000 }).toEqual([
+        '/first-missing.bin',
+        '/second-missing.bin',
+      ]);
+    } finally {
+      done = true;
+      Atomics.store(i32, SAB_STATUS_IDX, STATUS_IDLE);
+      originalNotify(i32, SAB_STATUS_IDX);
+      await watcher;
+      Object.defineProperty(Atomics, 'notify', {
+        configurable: true,
+        writable: true,
+        value: originalNotify,
+      });
+    }
+  });
+
   it('transfers a file smaller than one chunk in a single read', async () => {
     const bytes = pattern(1024);
     const got = await transfer('/small.bin', async () => bytes);
