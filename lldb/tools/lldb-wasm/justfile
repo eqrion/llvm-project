@@ -10,7 +10,8 @@ build-native:
         -DLLVM_ENABLE_PROJECTS="clang;lldb" \
         -DLLVM_TARGETS_TO_BUILD=WebAssembly \
         -DCMAKE_BUILD_TYPE=Release \
-        -DLLVM_ENABLE_ASSERTIONS=OFF
+        -DLLVM_ENABLE_ASSERTIONS=OFF \
+        -DLLDB_INCLUDE_TESTS=OFF
     cmake --build {{build_native}} \
         --target llvm-tblgen clang-tblgen lldb-tblgen \
         -- -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
@@ -19,7 +20,8 @@ build-native:
 configure-wasm:
     {{emcmake}} cmake -S {{root}}/llvm -B {{build_wasm}} \
         -C {{root}}/lldb/cmake/caches/Emscripten.cmake \
-        -DLLVM_NATIVE_TOOL_DIR={{build_native}}/bin
+        -DLLVM_NATIVE_TOOL_DIR={{build_native}}/bin \
+        -DLLDB_INCLUDE_TESTS=OFF
 
 # Build the lldb-wasm target.
 build-wasm:
@@ -58,6 +60,11 @@ npm-build: build-wasm
 # Pack the npm package into a tarball (for local testing with npm install).
 npm-pack: npm-build
     cd {{pkg}} && npm pack
+
+# Full clean rebuild and verify the npm package without publishing it.
+publish-prep: clean-all build-all
+    cd {{pkg}} && npm run build
+    cd {{pkg}} && npm pack --dry-run
 
 # Run the demo dev server (serves with COOP/COEP headers for SharedArrayBuffer).
 # Requires `just npm-build` first.
