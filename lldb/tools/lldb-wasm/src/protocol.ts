@@ -4,7 +4,12 @@ import type { StopReason } from './types.js';
 
 // Main thread → Worker
 export type Request =
-  | { id: number; method: 'init'; wasmJsUrl: string; fileSAB: SharedArrayBuffer }
+  | {
+      id: number;
+      method: 'init';
+      wasmJsUrl: string;
+      fileSAB: SharedArrayBuffer;
+    }
   | { id: number; method: string; args: unknown[] };
 
 // Worker → Main thread (in response to a Request)
@@ -29,6 +34,18 @@ export interface OutputEvent {
 // Worker → Main thread (unsolicited, interpreter exited via quit/EOF)
 export interface InterpreterExitEvent {
   type: 'interpreterExit';
+}
+
+// Worker → Main thread (unsolicited, DAP stdout bytes)
+export interface DAPOutputEvent {
+  type: 'dapOutput';
+  data: number[];
+}
+
+// Worker → Main thread (unsolicited, DAP loop exited)
+export interface DAPExitEvent {
+  type: 'dapExit';
+  error?: string;
 }
 
 // Worker → Main thread (unsolicited, bytes LLDB wrote to a bridged channel's
@@ -61,6 +78,8 @@ export type WorkerMessage =
   | StopEvent
   | OutputEvent
   | InterpreterExitEvent
+  | DAPOutputEvent
+  | DAPExitEvent
   | ChannelDataEvent
   | SessionResultEvent
   | ReadyMessage

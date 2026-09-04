@@ -2,14 +2,33 @@
 // Runs inside a dedicated Web Worker (browser) or worker_threads Worker (Node).
 
 import type {
-  Request, Response, StopEvent, OutputEvent, InterpreterExitEvent,
-  ChannelDataEvent, SessionResultEvent, ReadyMessage, ErrorMessage,
+  Request,
+  Response,
+  StopEvent,
+  OutputEvent,
+  InterpreterExitEvent,
+  DAPOutputEvent,
+  DAPExitEvent,
+  ChannelDataEvent,
+  SessionResultEvent,
+  ReadyMessage,
+  ErrorMessage,
 } from './protocol.js';
 import type { StopReason } from './types.js';
 import {
-  SAB_STATUS_IDX, SAB_OP_IDX, SAB_PATH_LEN_IDX, SAB_OFFSET_IDX, SAB_RESULT_IDX,
-  SAB_PATH_OFFSET, SAB_MAX_PATH, SAB_DATA_OFFSET,
-  STATUS_IDLE, STATUS_PENDING, STATUS_READY, OP_SIZE, OP_READ,
+  SAB_STATUS_IDX,
+  SAB_OP_IDX,
+  SAB_PATH_LEN_IDX,
+  SAB_OFFSET_IDX,
+  SAB_RESULT_IDX,
+  SAB_PATH_OFFSET,
+  SAB_MAX_PATH,
+  SAB_DATA_OFFSET,
+  STATUS_IDLE,
+  STATUS_PENDING,
+  STATUS_READY,
+  OP_SIZE,
+  OP_READ,
 } from './fileprovider.js';
 
 // ---------------------------------------------------------------------------
@@ -23,10 +42,15 @@ interface WorkerPort {
 
 async function getPort(): Promise<WorkerPort> {
   // Browser DedicatedWorkerGlobalScope has self.postMessage.
-  if (typeof self !== 'undefined' && typeof (self as { postMessage?: unknown }).postMessage === 'function') {
+  if (
+    typeof self !== 'undefined' &&
+    typeof (self as { postMessage?: unknown }).postMessage === 'function'
+  ) {
     const w = self as DedicatedWorkerGlobalScope;
     return {
-      onMessage: (h) => { w.onmessage = (e: MessageEvent) => h(e.data); },
+      onMessage: (h) => {
+        w.onmessage = (e: MessageEvent) => h(e.data);
+      },
       postMessage: (d) => w.postMessage(d),
     };
   }
@@ -84,9 +108,12 @@ function makeDispatch(): Map<string, Handler> {
   d.set('connect', ([url, errBufLen = 512]: unknown[]) => {
     const errBuf = mod._malloc(errBufLen as number);
     try {
-      const ret = ccall('lldb_wasm_connect', 'number',
+      const ret = ccall(
+        'lldb_wasm_connect',
+        'number',
         ['number', 'string', 'number', 'number'],
-        [handle, url, errBuf, errBufLen]);
+        [handle, url, errBuf, errBufLen],
+      );
       if (ret !== 0) {
         throw new Error(mod.UTF8ToString(errBuf) || 'connect failed');
       }
@@ -105,23 +132,34 @@ function makeDispatch(): Map<string, Handler> {
     const bytes = data as Uint8Array;
     const buf = mod._malloc(bytes.byteLength);
     mod.HEAPU8.set(bytes, buf);
-    const ret = ccall('lldb_wasm_attach_wasm_module', 'number',
+    const ret = ccall(
+      'lldb_wasm_attach_wasm_module',
+      'number',
       ['number', 'string', 'number', 'number'],
-      [handle, name, buf, bytes.byteLength]);
+      [handle, name, buf, bytes.byteLength],
+    );
     mod._free(buf);
     if (ret !== 0) throw new Error(`failed to attach module: ${name}`);
   });
 
   d.set('setBreakpoint', ([file, line]: unknown[]) => {
-    const id = ccall('lldb_wasm_set_breakpoint_by_location', 'number',
-      ['number', 'string', 'number'], [handle, file, line]);
+    const id = ccall(
+      'lldb_wasm_set_breakpoint_by_location',
+      'number',
+      ['number', 'string', 'number'],
+      [handle, file, line],
+    );
     if (!id) throw new Error(`failed to set breakpoint at ${file}:${line}`);
     return id;
   });
 
   d.set('setBreakpointByAddress', ([lo, hi]: unknown[]) => {
-    const id = ccall('lldb_wasm_set_breakpoint_by_address', 'number',
-      ['number', 'number', 'number'], [handle, lo, hi]);
+    const id = ccall(
+      'lldb_wasm_set_breakpoint_by_address',
+      'number',
+      ['number', 'number', 'number'],
+      [handle, lo, hi],
+    );
     if (!id) throw new Error(`failed to set breakpoint at address`);
     return id;
   });
@@ -131,8 +169,12 @@ function makeDispatch(): Map<string, Handler> {
   });
 
   d.set('enableBreakpoint', ([bpId, enable]: unknown[]) => {
-    ccall('lldb_wasm_enable_breakpoint', null,
-      ['number', 'number', 'number'], [handle, bpId, enable ? 1 : 0]);
+    ccall(
+      'lldb_wasm_enable_breakpoint',
+      null,
+      ['number', 'number', 'number'],
+      [handle, bpId, enable ? 1 : 0],
+    );
   });
 
   d.set('resume', () => {
@@ -145,20 +187,24 @@ function makeDispatch(): Map<string, Handler> {
     if (ret !== 0) throw new Error('pause failed');
   });
 
-  d.set('stepOver', () => { ccall('lldb_wasm_step_over', 'number', ['number'], [handle]); });
-  d.set('stepInto', () => { ccall('lldb_wasm_step_into', 'number', ['number'], [handle]); });
-  d.set('stepOut',  () => { ccall('lldb_wasm_step_out',  'number', ['number'], [handle]); });
+  d.set('stepOver', () => {
+    ccall('lldb_wasm_step_over', 'number', ['number'], [handle]);
+  });
+  d.set('stepInto', () => {
+    ccall('lldb_wasm_step_into', 'number', ['number'], [handle]);
+  });
+  d.set('stepOut', () => {
+    ccall('lldb_wasm_step_out', 'number', ['number'], [handle]);
+  });
 
   d.set('getStopReason', () => {
     const ptr = ccall('lldb_wasm_get_stop_reason', 'number', ['number'], [handle]) as number;
     return JSON.parse(getAndFreeString(ptr)) as StopReason;
   });
 
-  d.set('getNumThreads', () =>
-    ccall('lldb_wasm_get_num_threads', 'number', ['number'], [handle]));
+  d.set('getNumThreads', () => ccall('lldb_wasm_get_num_threads', 'number', ['number'], [handle]));
 
-  d.set('getNumFrames', () =>
-    ccall('lldb_wasm_get_num_frames', 'number', ['number'], [handle]));
+  d.set('getNumFrames', () => ccall('lldb_wasm_get_num_frames', 'number', ['number'], [handle]));
 
   d.set('getStackTrace', () => {
     const ptr = ccall('lldb_wasm_get_frame_info', 'number', ['number'], [handle]) as number;
@@ -166,8 +212,12 @@ function makeDispatch(): Map<string, Handler> {
   });
 
   d.set('getVariables', ([frameIndex = 0]: unknown[]) => {
-    const ptr = ccall('lldb_wasm_get_variables_json', 'number',
-      ['number', 'number'], [handle, frameIndex]) as number;
+    const ptr = ccall(
+      'lldb_wasm_get_variables_json',
+      'number',
+      ['number', 'number'],
+      [handle, frameIndex],
+    ) as number;
     return JSON.parse(getAndFreeString(ptr));
   });
 
@@ -175,9 +225,12 @@ function makeDispatch(): Map<string, Handler> {
     const buf = mod._malloc(size as number);
     const bytesReadBuf = mod._malloc(4);
     try {
-      const ret = ccall('lldb_wasm_read_memory', 'number',
+      const ret = ccall(
+        'lldb_wasm_read_memory',
+        'number',
         ['number', 'number', 'number', 'number', 'number', 'number'],
-        [handle, lo, hi, buf, size, bytesReadBuf]);
+        [handle, lo, hi, buf, size, bytesReadBuf],
+      );
       if (ret !== 0) throw new Error('readMemory failed');
       const n = mod.HEAPU32[bytesReadBuf >> 2] ?? 0;
       return Array.from(mod.HEAPU8.subarray(buf, buf + n));
@@ -188,14 +241,22 @@ function makeDispatch(): Map<string, Handler> {
   });
 
   d.set('evaluateExpression', ([expr, frameIndex = 0]: unknown[]) => {
-    const ptr = ccall('lldb_wasm_evaluate_expression', 'number',
-      ['number', 'number', 'string'], [handle, frameIndex, expr]) as number;
+    const ptr = ccall(
+      'lldb_wasm_evaluate_expression',
+      'number',
+      ['number', 'number', 'string'],
+      [handle, frameIndex, expr],
+    ) as number;
     return JSON.parse(getAndFreeString(ptr));
   });
 
   d.set('runCommand', ([command]: unknown[]) => {
-    const ptr = ccall('lldb_wasm_run_command', 'number',
-      ['number', 'string'], [handle, command]) as number;
+    const ptr = ccall(
+      'lldb_wasm_run_command',
+      'number',
+      ['number', 'string'],
+      [handle, command],
+    ) as number;
     return JSON.parse(getAndFreeString(ptr));
   });
 
@@ -209,8 +270,7 @@ function makeDispatch(): Map<string, Handler> {
     const buf = mod._malloc(bytes.length);
     mod.HEAPU8.set(bytes, buf);
     try {
-      ccall('lldb_wasm_console_stdin_write', 'number',
-        ['number', 'number'], [buf, bytes.length]);
+      ccall('lldb_wasm_console_stdin_write', 'number', ['number', 'number'], [buf, bytes.length]);
     } finally {
       mod._free(buf);
     }
@@ -220,12 +280,50 @@ function makeDispatch(): Map<string, Handler> {
     ccall('lldb_wasm_console_stdin_close', null, [], []);
   });
 
-  d.set('createChannel', () =>
-    ccall('lldb_wasm_create_channel', 'number', [], []));
+  d.set('dapStart', ([preInitCommands, noLldbInit]: unknown[]) => {
+    const ret = ccall(
+      'lldb_wasm_dap_start',
+      'number',
+      ['string', 'number'],
+      [preInitCommands, noLldbInit ? 1 : 0],
+    ) as number;
+    if (ret !== 0) {
+      const ptr = ccall('lldb_wasm_dap_error', 'number', [], []) as number;
+      throw new Error(getAndFreeString(ptr) || 'failed to start DAP');
+    }
+    startDAPDrain();
+  });
+
+  d.set('dapStdinWrite', ([data]: unknown[]) => {
+    const bytes = data as number[];
+    const buf = mod._malloc(bytes.length);
+    mod.HEAPU8.set(bytes, buf);
+    try {
+      const n = ccall(
+        'lldb_wasm_dap_stdin_write',
+        'number',
+        ['number', 'number'],
+        [buf, bytes.length],
+      ) as number;
+      if (n !== bytes.length) throw new Error('failed to write DAP input');
+    } finally {
+      mod._free(buf);
+    }
+  });
+
+  d.set('dapStdinClose', () => {
+    ccall('lldb_wasm_dap_stdin_close', null, [], []);
+  });
+
+  d.set('createChannel', () => ccall('lldb_wasm_create_channel', 'number', [], []));
 
   d.set('connectInProcess', ([channelId]: unknown[]) => {
-    const ret = ccall('lldb_wasm_connect_inprocess', 'number',
-      ['number', 'number'], [handle, channelId]);
+    const ret = ccall(
+      'lldb_wasm_connect_inprocess',
+      'number',
+      ['number', 'number'],
+      [handle, channelId],
+    );
     if (ret !== 0) throw new Error('connectInProcess failed');
     startPoll();
   });
@@ -234,8 +332,12 @@ function makeDispatch(): Map<string, Handler> {
     const bytes = data as number[];
     const buf = mod._malloc(bytes.length);
     mod.HEAPU8.set(bytes, buf);
-    const n = ccall('lldb_wasm_channel_server_write', 'number',
-      ['number', 'number', 'number'], [channelId, buf, bytes.length]) as number;
+    const n = ccall(
+      'lldb_wasm_channel_server_write',
+      'number',
+      ['number', 'number', 'number'],
+      [channelId, buf, bytes.length],
+    ) as number;
     mod._free(buf);
     if (n < 0) throw new Error(`channel ${String(channelId)} not found`);
     return n;
@@ -244,9 +346,12 @@ function makeDispatch(): Map<string, Handler> {
   d.set('channelServerRead', ([channelId, maxBytes, timeoutMs = 1000]: unknown[]) => {
     const buf = mod._malloc(maxBytes as number);
     try {
-      const n = ccall('lldb_wasm_channel_server_read', 'number',
+      const n = ccall(
+        'lldb_wasm_channel_server_read',
+        'number',
         ['number', 'number', 'number', 'number'],
-        [channelId, buf, maxBytes, timeoutMs]) as number;
+        [channelId, buf, maxBytes, timeoutMs],
+      ) as number;
       if (n < 0) throw new Error(`channel ${String(channelId)} not found`);
       return n > 0 ? Array.from(mod.HEAPU8.subarray(buf, buf + n)) : [];
     } finally {
@@ -275,8 +380,12 @@ function makeDispatch(): Map<string, Handler> {
   // result arrives later via the drain timer as a 'sessionResult' event.
   d.set('sessionCommand', ([sessionId, cmd]: unknown[]) => {
     ensureDrainTimer();
-    ccall('lldb_wasm_session_command', null,
-      ['number', 'number', 'string'], [sessionId, handle, cmd]);
+    ccall(
+      'lldb_wasm_session_command',
+      null,
+      ['number', 'number', 'string'],
+      [sessionId, handle, cmd],
+    );
   });
   d.set('sessionState', ([sessionId]: unknown[]) => {
     ensureDrainTimer();
@@ -288,8 +397,12 @@ function makeDispatch(): Map<string, Handler> {
   });
   d.set('sessionVariable', ([sessionId, frameIndex, name]: unknown[]) => {
     ensureDrainTimer();
-    ccall('lldb_wasm_session_variable', null,
-      ['number', 'number', 'number', 'string'], [sessionId, handle, frameIndex, name]);
+    ccall(
+      'lldb_wasm_session_variable',
+      null,
+      ['number', 'number', 'number', 'string'],
+      [sessionId, handle, frameIndex, name],
+    );
   });
 
   return d;
@@ -325,6 +438,7 @@ let drainBuf = 0;
 let sessionBuf = 0;
 let sessionLenPtr = 0;
 let interpreterDraining = false;
+let dapDraining = false;
 const bridgedChannels = new Set<number>();
 const DRAIN_BUF_SIZE = 16384;
 const SESSION_BUF_SIZE = 1 << 16;
@@ -336,29 +450,64 @@ function port(): WorkerPort | undefined {
 
 function drainConsole(p: WorkerPort | undefined): void {
   for (;;) {
-    const n = ccall('lldb_wasm_console_stdout_read', 'number',
-      ['number', 'number'], [drainBuf, DRAIN_BUF_SIZE]) as number;
+    const n = ccall(
+      'lldb_wasm_console_stdout_read',
+      'number',
+      ['number', 'number'],
+      [drainBuf, DRAIN_BUF_SIZE],
+    ) as number;
     if (n <= 0) break;
-    p?.postMessage({ type: 'output', data: Array.from(mod.HEAPU8.subarray(drainBuf, drainBuf + n)) } as OutputEvent);
+    p?.postMessage({
+      type: 'output',
+      data: Array.from(mod.HEAPU8.subarray(drainBuf, drainBuf + n)),
+    } as OutputEvent);
+    if (n < DRAIN_BUF_SIZE) break;
+  }
+}
+
+function drainDAP(p: WorkerPort | undefined): void {
+  for (;;) {
+    const n = ccall(
+      'lldb_wasm_dap_stdout_read',
+      'number',
+      ['number', 'number'],
+      [drainBuf, DRAIN_BUF_SIZE],
+    ) as number;
+    if (n <= 0) break;
+    p?.postMessage({
+      type: 'dapOutput',
+      data: Array.from(mod.HEAPU8.subarray(drainBuf, drainBuf + n)),
+    } as DAPOutputEvent);
     if (n < DRAIN_BUF_SIZE) break;
   }
 }
 
 function drainChannel(channelId: number, p: WorkerPort | undefined): void {
   for (;;) {
-    const n = ccall('lldb_wasm_channel_server_read', 'number',
+    const n = ccall(
+      'lldb_wasm_channel_server_read',
+      'number',
       ['number', 'number', 'number', 'number'],
-      [channelId, drainBuf, DRAIN_BUF_SIZE, 0]) as number;
+      [channelId, drainBuf, DRAIN_BUF_SIZE, 0],
+    ) as number;
     if (n <= 0) break;
-    p?.postMessage({ type: 'channelData', channelId, data: Array.from(mod.HEAPU8.subarray(drainBuf, drainBuf + n)) } as ChannelDataEvent);
+    p?.postMessage({
+      type: 'channelData',
+      channelId,
+      data: Array.from(mod.HEAPU8.subarray(drainBuf, drainBuf + n)),
+    } as ChannelDataEvent);
     if (n < DRAIN_BUF_SIZE) break;
   }
 }
 
 function drainSession(p: WorkerPort | undefined): void {
   for (;;) {
-    const id = ccall('lldb_wasm_session_poll', 'number',
-      ['number', 'number', 'number'], [sessionBuf, SESSION_BUF_SIZE, sessionLenPtr]) as number;
+    const id = ccall(
+      'lldb_wasm_session_poll',
+      'number',
+      ['number', 'number', 'number'],
+      [sessionBuf, SESSION_BUF_SIZE, sessionLenPtr],
+    ) as number;
     if (id === 0) break;
     const len = mod.HEAPU32[sessionLenPtr >> 2] ?? 0;
     const json = sessionDecoder.decode(mod.HEAPU8.subarray(sessionBuf, sessionBuf + len));
@@ -381,6 +530,20 @@ function ensureDrainTimer(): void {
         p?.postMessage({ type: 'interpreterExit' } as InterpreterExitEvent);
       }
     }
+    if (dapDraining) {
+      drainDAP(p);
+      const status = ccall('lldb_wasm_dap_status', 'number', [], []) as number;
+      if (status !== 0) {
+        drainDAP(p);
+        dapDraining = false;
+        let error: string | undefined;
+        if (status < 0) {
+          const ptr = ccall('lldb_wasm_dap_error', 'number', [], []) as number;
+          error = getAndFreeString(ptr) || 'DAP loop failed';
+        }
+        p?.postMessage({ type: 'dapExit', error } as DAPExitEvent);
+      }
+    }
     for (const id of bridgedChannels) drainChannel(id, p);
     drainSession(p);
   }, 1);
@@ -388,6 +551,11 @@ function ensureDrainTimer(): void {
 
 function startConsoleDrain(): void {
   interpreterDraining = true;
+  ensureDrainTimer();
+}
+
+function startDAPDrain(): void {
+  dapDraining = true;
   ensureDrainTimer();
 }
 
@@ -430,7 +598,7 @@ function fileRequest(
   consume?: (result: number, data: Uint8Array) => void,
 ): number | null {
   const i32 = new Int32Array(sab);
-  const u8  = new Uint8Array(sab);
+  const u8 = new Uint8Array(sab);
 
   const pathBytes = new TextEncoder().encode(path);
   if (pathBytes.byteLength > SAB_MAX_PATH) return null;
@@ -484,7 +652,11 @@ function ensureDirs(FS: Record<string, (...a: unknown[]) => unknown>, path: stri
     const p = parts[i];
     if (!p) continue;
     current += '/' + p;
-    try { (FS['mkdir'] as (p: string) => void)(current); } catch { /* already exists */ }
+    try {
+      (FS['mkdir'] as (p: string) => void)(current);
+    } catch {
+      /* already exists */
+    }
   }
 }
 
@@ -507,7 +679,10 @@ function installFSBridge(sab: SharedArrayBuffer): void {
       if (!e || (e as { errno?: number }).errno !== 44) return; // not ENOENT
     }
     const data = fetchFileSync(sab, path);
-    if (!data) { notFound.add(path); return; }
+    if (!data) {
+      notFound.add(path);
+      return;
+    }
     ensureDirs(FS as Record<string, (...a: unknown[]) => unknown>, path);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mod as any).FS.writeFile(path, data);
@@ -547,10 +722,15 @@ const dispatch = makeDispatch();
 
     // Special init message: load the wasm module.
     if (req.method === 'init') {
-      const initReq = req as { id: number; method: 'init'; wasmJsUrl: string; fileSAB: SharedArrayBuffer };
+      const initReq = req as {
+        id: number;
+        method: 'init';
+        wasmJsUrl: string;
+        fileSAB: SharedArrayBuffer;
+      };
       try {
         const { default: createLLDB } = await import(initReq.wasmJsUrl);
-        mod = await createLLDB() as LLDBMod;
+        mod = (await createLLDB()) as LLDBMod;
         installFSBridge(initReq.fileSAB);
         ccall('lldb_wasm_initialize', null, [], []);
         handle = ccall('lldb_wasm_create_debugger', 'number', [], []) as number;
@@ -570,7 +750,10 @@ const dispatch = makeDispatch();
 
     const handler = dispatch.get(req.method);
     if (!handler) {
-      const res: Response = { id: req.id, error: `unknown method: ${req.method}` };
+      const res: Response = {
+        id: req.id,
+        error: `unknown method: ${req.method}`,
+      };
       port.postMessage(res);
       return;
     }

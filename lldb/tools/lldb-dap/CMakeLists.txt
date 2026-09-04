@@ -91,4 +91,6 @@ if(LLDB_DAP_WELCOME_MESSAGE)
     -DLLDB_DAP_WELCOME_MESSAGE=\"${LLDB_DAP_WELCOME_MESSAGE}\")
 endif()
 
-add_subdirectory(tool)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  add_subdirectory(tool)
+endif()

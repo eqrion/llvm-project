@@ -1,4 +1,4 @@
-# @eqrion/lldb-wasm
+# lldb-wasm
 
 LLDB compiled to WebAssembly. Runs entirely in the browser or Node.js -- no
 native binary required. Built for debugging WebAssembly modules via a GDB
@@ -20,13 +20,13 @@ Node.js 18+ is supported without any special flags.
 ## Installation
 
 ```
-npm install @eqrion/lldb-wasm
+npm install lldb-wasm
 ```
 
 ## Usage
 
 ```js
-import { LLDBClient } from '@eqrion/lldb-wasm';
+import { LLDBClient } from 'lldb-wasm';
 
 // Start LLDB in a Web Worker. Returns once the wasm module is loaded.
 const lldb = await LLDBClient.create();
@@ -35,7 +35,7 @@ const lldb = await LLDBClient.create();
 await lldb.connect('ws://localhost:9000');
 
 // Load the wasm module under debug.
-const bytes = await fetch('/app.wasm').then(r => r.arrayBuffer());
+const bytes = await fetch('/app.wasm').then((r) => r.arrayBuffer());
 await lldb.attachWasmModule('app.wasm', new Uint8Array(bytes));
 
 // Set a breakpoint and run.
@@ -45,13 +45,38 @@ await lldb.resume();
 // Inspect state when stopped.
 lldb.onStop(async (reason) => {
   const frames = await lldb.getStackTrace();
-  const vars   = await lldb.getVariables();
+  const vars = await lldb.getVariables();
   console.log(reason, frames, vars);
 });
 
 // Clean up when done.
 await lldb.destroy();
 ```
+
+### Debug Adapter Protocol
+
+The package also embeds upstream LLDB's Debug Adapter Protocol implementation.
+`startDAP()` exposes it as a byte stream, so an embedder can connect it to an
+editor over stdio, a socket, or another transport without parsing or
+reimplementing DAP:
+
+```js
+const dap = await lldb.startDAP({
+  preInitCommands: ['platform select remote-gdb-server', 'platform connect inprocess://1'],
+});
+
+dap.onData((bytes) => editor.write(bytes));
+editor.onData((bytes) => void dap.write(bytes));
+editor.onEnd(() => void dap.close());
+
+await dap.done;
+```
+
+The bytes retain DAP's normal `Content-Length` framing. `preInitCommands` run
+when the client sends `initialize`, before the adapter creates a target. One DAP
+session can be started per `LLDBClient`; create a new client for another
+session. The embedder remains responsible for any transport LLDB commands use,
+such as bridging the `inprocess://` channel in the example.
 
 ### Hosting the wasm file yourself
 

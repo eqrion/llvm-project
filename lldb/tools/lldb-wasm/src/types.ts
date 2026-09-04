@@ -43,14 +43,32 @@ export interface SessionVariable {
 }
 
 export type ExpressionResult =
-  | { value: string; type: string; error?: never }
-  | { error: string; value?: never; type?: never };
+  { value: string; type: string; error?: never } | { error: string; value?: never; type?: never };
 
 export interface LLDBClientOptions {
   /** URL of lldb-wasm.js (the Emscripten output). Defaults to the bundled copy. */
   wasmJsUrl?: string;
   /** URL of the compiled worker script. Defaults to dist/worker.js alongside the package. */
   workerUrl?: string;
+}
+
+export interface DAPOptions {
+  /** LLDB commands run immediately after the DAP debugger is created. */
+  preInitCommands?: string[];
+  /** Do not source global or user .lldbinit files. Defaults to true. */
+  noLldbInit?: boolean;
+}
+
+/** A byte-oriented session backed by LLDB's built-in Debug Adapter Protocol. */
+export interface DAPSession {
+  /** Resolves when the adapter exits; rejects if its protocol loop fails. */
+  readonly done: Promise<void>;
+  /** Feed DAP-framed bytes from the client to LLDB. */
+  write(data: Uint8Array): Promise<void>;
+  /** Close the adapter input stream. Safe to call more than once. */
+  close(): Promise<void>;
+  /** Subscribe to DAP-framed bytes emitted by LLDB. */
+  onData(callback: (data: Uint8Array) => void): void;
 }
 
 /**

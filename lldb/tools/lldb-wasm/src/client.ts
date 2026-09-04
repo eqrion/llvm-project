@@ -2,6 +2,8 @@ import type { Response, WorkerMessage } from './protocol.js';
 import { watchForFileRequests, SAB_SIZE } from './fileprovider.js';
 import type {
   CommandResult,
+  DAPOptions,
+  DAPSession,
   ExpressionResult,
   FileProvider,
   FrameInfo,
@@ -10,6 +12,52 @@ import type {
   StopReason,
   Variable,
 } from './types.js';
+
+class DAPSessionImpl implements DAPSession {
+  readonly #listeners: Array<(data: Uint8Array) => void> = [];
+  readonly #write: (data: Uint8Array) => Promise<void>;
+  readonly #close: () => Promise<void>;
+  readonly done: Promise<void>;
+  #resolveDone!: () => void;
+  #rejectDone!: (error: Error) => void;
+  #finished = false;
+  #closed = false;
+
+  constructor(write: (data: Uint8Array) => Promise<void>, close: () => Promise<void>) {
+    this.#write = write;
+    this.#close = close;
+    this.done = new Promise<void>((resolve, reject) => {
+      this.#resolveDone = resolve;
+      this.#rejectDone = reject;
+    });
+  }
+
+  write(data: Uint8Array): Promise<void> {
+    if (this.#finished) return Promise.reject(new Error('DAP session has exited'));
+    return this.#write(data);
+  }
+
+  close(): Promise<void> {
+    if (this.#closed) return Promise.resolve();
+    this.#closed = true;
+    return this.#close();
+  }
+
+  onData(callback: (data: Uint8Array) => void): void {
+    this.#listeners.push(callback);
+  }
+
+  emit(data: Uint8Array): void {
+    for (const callback of this.#listeners) callback(data);
+  }
+
+  finish(error?: string): void {
+    if (this.#finished) return;
+    this.#finished = true;
+    if (error) this.#rejectDone(new Error(error));
+    else this.#resolveDone();
+  }
+}
 
 // Minimal Worker surface LLDBClient relies on. In the browser this is the DOM
 // Worker; in Node it is an adapter over worker_threads (see makeWorker).
@@ -24,13 +72,18 @@ interface WorkerLike {
 // adapts Node's worker_threads to the browser Worker event interface so the
 // package works unchanged under Node (e.g. when embedded in a CLI).
 async function makeWorker(url: URL): Promise<WorkerLike> {
-  const G = globalThis as { Worker?: new (u: URL, o?: { type: string }) => WorkerLike };
+  const G = globalThis as {
+    Worker?: new (u: URL, o?: { type: string }) => WorkerLike;
+  };
   if (typeof G.Worker !== 'undefined') {
     return new G.Worker(url, { type: 'module' });
   }
   const { Worker: NodeWorker } = await import('node:worker_threads');
   const w = new NodeWorker(url);
-  const handlers = new Map<(e: MessageEvent<WorkerMessage>) => void, (data: WorkerMessage) => void>();
+  const handlers = new Map<
+    (e: MessageEvent<WorkerMessage>) => void,
+    (data: WorkerMessage) => void
+  >();
   return {
     addEventListener(_type, cb) {
       const h = (data: WorkerMessage) => cb({ data } as MessageEvent<WorkerMessage>);
@@ -39,7 +92,10 @@ async function makeWorker(url: URL): Promise<WorkerLike> {
     },
     removeEventListener(_type, cb) {
       const h = handlers.get(cb);
-      if (h) { w.off('message', h); handlers.delete(cb); }
+      if (h) {
+        w.off('message', h);
+        handlers.delete(cb);
+      }
     },
     postMessage: (data) => w.postMessage(data),
     terminate: () => w.terminate().then(() => {}),
@@ -48,7 +104,10 @@ async function makeWorker(url: URL): Promise<WorkerLike> {
 
 export class LLDBClient {
   readonly #worker: WorkerLike;
-  readonly #pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  readonly #pending = new Map<
+    number,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >();
   readonly #stopListeners: Array<(r: StopReason) => void> = [];
   readonly #outputListeners: Array<(data: Uint8Array) => void> = [];
   readonly #exitListeners: Array<() => void> = [];
@@ -58,6 +117,7 @@ export class LLDBClient {
   #nextId = 0;
   #destroyed = false;
   #fileProvider: FileProvider | null = null;
+  #dapSession: DAPSessionImpl | null = null;
 
   private constructor(worker: WorkerLike) {
     this.#worker = worker;
@@ -71,6 +131,10 @@ export class LLDBClient {
           for (const cb of this.#outputListeners) cb(bytes);
         } else if (msg.type === 'interpreterExit') {
           for (const cb of this.#exitListeners) cb();
+        } else if (msg.type === 'dapOutput') {
+          this.#dapSession?.emit(new Uint8Array(msg.data));
+        } else if (msg.type === 'dapExit') {
+          this.#dapSession?.finish(msg.error);
         } else if (msg.type === 'channelData') {
           this.#channelListeners.get(msg.channelId)?.(new Uint8Array(msg.data));
         } else if (msg.type === 'sessionResult') {
@@ -140,9 +204,7 @@ export class LLDBClient {
       };
       worker.addEventListener('message', onMessage);
 
-      const wasmJsUrl =
-        options.wasmJsUrl ??
-        new URL('../wasm/lldb-wasm.js', import.meta.url).href;
+      const wasmJsUrl = options.wasmJsUrl ?? new URL('../wasm/lldb-wasm.js', import.meta.url).href;
 
       const fileSAB = new SharedArrayBuffer(SAB_SIZE);
 
@@ -208,11 +270,21 @@ export class LLDBClient {
   // Execution control
   // -------------------------------------------------------------------------
 
-  resume(): Promise<void>   { return this.call('resume'); }
-  pause(): Promise<void>    { return this.call('pause'); }
-  stepOver(): Promise<void> { return this.call('stepOver'); }
-  stepInto(): Promise<void> { return this.call('stepInto'); }
-  stepOut(): Promise<void>  { return this.call('stepOut'); }
+  resume(): Promise<void> {
+    return this.call('resume');
+  }
+  pause(): Promise<void> {
+    return this.call('pause');
+  }
+  stepOver(): Promise<void> {
+    return this.call('stepOver');
+  }
+  stepInto(): Promise<void> {
+    return this.call('stepInto');
+  }
+  stepOut(): Promise<void> {
+    return this.call('stepOut');
+  }
 
   // -------------------------------------------------------------------------
   // State inspection
@@ -293,6 +365,33 @@ export class LLDBClient {
   }
 
   // -------------------------------------------------------------------------
+  // Debug Adapter Protocol
+  // -------------------------------------------------------------------------
+
+  /** Start LLDB's built-in DAP server and return its byte-stream session. */
+  async startDAP(options: DAPOptions = {}): Promise<DAPSession> {
+    if (this.#dapSession) throw new Error('a DAP session has already been started');
+    const session = new DAPSessionImpl(
+      async (data) => {
+        await this.call('dapStdinWrite', Array.from(data));
+      },
+      () => this.call('dapStdinClose'),
+    );
+    this.#dapSession = session;
+    try {
+      await this.call(
+        'dapStart',
+        JSON.stringify(options.preInitCommands ?? []),
+        options.noLldbInit ?? true,
+      );
+    } catch (error) {
+      this.#dapSession = null;
+      throw error;
+    }
+    return session;
+  }
+
+  // -------------------------------------------------------------------------
   // In-process channel (for GDB server in the same wasm module)
   // -------------------------------------------------------------------------
 
@@ -308,7 +407,11 @@ export class LLDBClient {
     return this.call('channelServerWrite', channelId, Array.from(data));
   }
 
-  async channelServerRead(channelId: number, maxBytes: number, timeoutMs = 1000): Promise<Uint8Array> {
+  async channelServerRead(
+    channelId: number,
+    maxBytes: number,
+    timeoutMs = 1000,
+  ): Promise<Uint8Array> {
     const arr = await this.call<number[]>('channelServerRead', channelId, maxBytes, timeoutMs);
     return new Uint8Array(arr);
   }
@@ -415,6 +518,7 @@ export class LLDBClient {
    */
   destroy(): void | Promise<void> {
     this.#destroyed = true;
+    this.#dapSession?.finish();
     const err = new Error('LLDBClient has been destroyed');
     for (const { reject } of this.#pending.values()) reject(err);
     this.#pending.clear();
