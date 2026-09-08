@@ -49,7 +49,6 @@
 #include <cstring>
 #include <emscripten.h>
 #include <functional>
-#include <map>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -78,21 +77,27 @@ public:
     m_cv.notify_one();
   }
 
-  // Pop one completed result. Returns its id (> 0) and fills out_json, or 0 if
-  // none are ready.
-  uint32_t Poll(std::string &out_json) {
+  // Pop one lifecycle event in execution order. A started event is queued when
+  // the session thread dequeues an operation; its result event follows after
+  // the blocking SB work completes.
+  uint32_t Poll(std::string &out_json, bool &out_started) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_ready.empty())
+    if (m_events.empty())
       return 0;
-    uint32_t id = m_ready.front();
-    m_ready.pop();
-    auto it = m_results.find(id);
-    out_json = std::move(it->second);
-    m_results.erase(it);
-    return id;
+    Event event = std::move(m_events.front());
+    m_events.pop();
+    out_started = event.started;
+    out_json = std::move(event.json);
+    return event.id;
   }
 
 private:
+  struct Event {
+    uint32_t id;
+    bool started;
+    std::string json;
+  };
+
   void EnsureStarted() {
     if (m_started.exchange(true))
       return;
@@ -107,12 +112,12 @@ private:
         m_cv.wait(lock, [this] { return !m_requests.empty(); });
         req = std::move(m_requests.front());
         m_requests.pop();
+        m_events.push({req.first, true, {}});
       }
       std::string result = req.second(); // blocking SB work; worker stays free
       {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_results[req.first] = std::move(result);
-        m_ready.push(req.first);
+        m_events.push({req.first, false, std::move(result)});
       }
     }
   }
@@ -121,8 +126,7 @@ private:
   std::mutex m_mutex;
   std::condition_variable m_cv;
   std::queue<std::pair<uint32_t, std::function<std::string()>>> m_requests;
-  std::map<uint32_t, std::string> m_results;
-  std::queue<uint32_t> m_ready;
+  std::queue<Event> m_events;
 };
 
 Session g_session;
@@ -1037,15 +1041,25 @@ EMSCRIPTEN_KEEPALIVE void lldb_wasm_session_variable(uint32_t req_id,
   });
 }
 
-// Drain one completed session result. Writes the result JSON into buf (up to
-// size bytes) and returns its request id, or 0 if none are ready.
+// Drain one session lifecycle event in execution order and return its request
+// id, or 0 if none are ready. out_kind is 0 for started and 1 for completed;
+// completed events write their result JSON into buf (up to size bytes).
 EMSCRIPTEN_KEEPALIVE uint32_t lldb_wasm_session_poll(uint8_t *buf,
                                                      uint32_t size,
-                                                     uint32_t *out_len) {
+                                                     uint32_t *out_len,
+                                                     uint32_t *out_kind) {
   std::string json;
-  uint32_t id = g_session.Poll(json);
+  bool started = false;
+  uint32_t id = g_session.Poll(json, started);
   if (id == 0)
     return 0;
+  if (out_kind)
+    *out_kind = started ? 0 : 1;
+  if (started) {
+    if (out_len)
+      *out_len = 0;
+    return id;
+  }
   uint32_t n = static_cast<uint32_t>(json.size());
   if (n > size)
     n = size;

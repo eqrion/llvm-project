@@ -45,11 +45,24 @@ export interface SessionVariable {
 export type ExpressionResult =
   { value: string; type: string; error?: never } | { error: string; value?: never; type?: never };
 
+/**
+ * Logging surface used by lldb-wasm. It is deliberately structural so an
+ * embedder can pass its existing logger without an adapter.
+ */
+export interface Logger {
+  debug(msg: string): void;
+  info(msg: string): void;
+  warn(msg: string): void;
+  error(msg: string): void;
+}
+
 export interface LLDBClientOptions {
   /** URL of lldb-wasm.js (the Emscripten output). Defaults to the bundled copy. */
   wasmJsUrl?: string;
   /** URL of the compiled worker script. Defaults to dist/worker.js alongside the package. */
   workerUrl?: string;
+  /** Receives worker, RPC, channel, and operation lifecycle diagnostics. */
+  logger?: Logger;
 }
 
 export interface DAPOptions {

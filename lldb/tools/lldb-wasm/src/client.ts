@@ -8,10 +8,46 @@ import type {
   FileProvider,
   FrameInfo,
   LLDBClientOptions,
+  Logger,
   SessionVariable,
   StopReason,
   Variable,
 } from './types.js';
+
+const noopLogger: Logger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+
+type LogLevel = keyof Logger;
+
+// These are byte-pump calls and can occur for every transport packet. Their
+// channel lifecycle is logged separately; per-call logs would bury the useful
+// debugger operations in noise.
+const untrackedMethods = new Set([
+  'channelServerRead',
+  'channelServerWrite',
+  'consoleStdinWrite',
+  'dapStdinWrite',
+]);
+
+function log(logger: Logger, level: LogLevel, event: string, fields: object = {}): void {
+  try {
+    logger[level](`[lldb-wasm] ${event} ${JSON.stringify(fields)}`);
+  } catch {
+    // Diagnostics must never affect debugger control flow.
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function now(): number {
+  return performance.now();
+}
 
 class DAPSessionImpl implements DAPSession {
   readonly #listeners: Array<(data: Uint8Array) => void> = [];
@@ -66,6 +102,16 @@ interface WorkerLike {
   removeEventListener(type: 'message', cb: (e: MessageEvent<WorkerMessage>) => void): void;
   postMessage(data: unknown): void;
   terminate(): void | Promise<void>;
+  onError(cb: (error: Error) => void): void;
+  onExit(cb: (code?: number) => void): void;
+}
+
+interface BrowserWorkerLike {
+  addEventListener(type: 'message', cb: (e: MessageEvent<WorkerMessage>) => void): void;
+  addEventListener(type: 'error', cb: (e: ErrorEvent) => void): void;
+  removeEventListener(type: 'message', cb: (e: MessageEvent<WorkerMessage>) => void): void;
+  postMessage(data: unknown): void;
+  terminate(): void;
 }
 
 // Construct a module worker. Uses the DOM Worker when available, otherwise
@@ -73,10 +119,21 @@ interface WorkerLike {
 // package works unchanged under Node (e.g. when embedded in a CLI).
 async function makeWorker(url: URL): Promise<WorkerLike> {
   const G = globalThis as {
-    Worker?: new (u: URL, o?: { type: string }) => WorkerLike;
+    Worker?: new (u: URL, o?: { type: string }) => BrowserWorkerLike;
   };
   if (typeof G.Worker !== 'undefined') {
-    return new G.Worker(url, { type: 'module' });
+    const worker = new G.Worker(url, { type: 'module' });
+    return {
+      addEventListener: (type, cb) => worker.addEventListener(type, cb),
+      removeEventListener: (type, cb) => worker.removeEventListener(type, cb),
+      postMessage: (data) => worker.postMessage(data),
+      terminate: () => worker.terminate(),
+      onError: (cb) =>
+        worker.addEventListener('error', (event) => cb(new Error(event.message || 'worker error'))),
+      // DedicatedWorker has no exit event. destroy() records termination after
+      // terminate() returns; runtime failures arrive through the error event.
+      onExit() {},
+    };
   }
   const { Worker: NodeWorker } = await import('node:worker_threads');
   const w = new NodeWorker(url);
@@ -99,28 +156,53 @@ async function makeWorker(url: URL): Promise<WorkerLike> {
     },
     postMessage: (data) => w.postMessage(data),
     terminate: () => w.terminate().then(() => {}),
+    onError: (cb) => w.on('error', cb),
+    onExit: (cb) => w.on('exit', cb),
   };
+}
+
+interface Operation {
+  method: string;
+  command?: string;
+  queuedAt: number;
+  startedAt?: number;
+}
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  operationId?: number;
+}
+
+interface PendingSessionOperation {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
 }
 
 export class LLDBClient {
   readonly #worker: WorkerLike;
-  readonly #pending = new Map<
-    number,
-    { resolve: (v: unknown) => void; reject: (e: Error) => void }
-  >();
+  readonly #logger: Logger;
+  readonly #pending = new Map<number, PendingRequest>();
+  readonly #operations = new Map<number, Operation>();
   readonly #stopListeners: Array<(r: StopReason) => void> = [];
   readonly #outputListeners: Array<(data: Uint8Array) => void> = [];
   readonly #exitListeners: Array<() => void> = [];
   readonly #channelListeners = new Map<number, (data: Uint8Array) => void>();
-  readonly #sessionPending = new Map<number, (v: unknown) => void>();
-  #sessionNextId = 1;
+  readonly #sessionPending = new Map<number, PendingSessionOperation>();
   #nextId = 0;
+  #nextOperationId = 1;
   #destroyed = false;
+  #rpcClosed = false;
+  #workerErrorReported = false;
+  #workerExited = false;
+  #destroyPromise: Promise<void> | null = null;
   #fileProvider: FileProvider | null = null;
   #dapSession: DAPSessionImpl | null = null;
 
-  private constructor(worker: WorkerLike) {
+  private constructor(worker: WorkerLike, logger: Logger) {
     this.#worker = worker;
+    this.#logger = logger;
+    log(this.#logger, 'debug', 'rpc.opened');
     worker.addEventListener('message', (e: MessageEvent<WorkerMessage>) => {
       const msg = e.data;
       if ('type' in msg) {
@@ -138,38 +220,154 @@ export class LLDBClient {
         } else if (msg.type === 'channelData') {
           this.#channelListeners.get(msg.channelId)?.(new Uint8Array(msg.data));
         } else if (msg.type === 'sessionResult') {
-          const cb = this.#sessionPending.get(msg.id);
-          if (cb) {
+          const pending = this.#sessionPending.get(msg.id);
+          if (pending) {
             this.#sessionPending.delete(msg.id);
-            cb(JSON.parse(msg.json));
+            try {
+              const result: unknown = JSON.parse(msg.json);
+              this.#finishOperation(msg.id, result);
+              pending.resolve(result);
+            } catch (error) {
+              const parsed = new Error(`invalid session result: ${errorText(error)}`);
+              this.#failOperation(msg.id, parsed);
+              pending.reject(parsed);
+            }
+          } else {
+            log(this.#logger, 'warn', 'session.result.unmatched', {
+              id: msg.id,
+              outstandingOperationIds: this.#outstandingOperationIds(),
+            });
           }
+        } else if (msg.type === 'operationStarted') {
+          this.#startOperation(msg.id);
         }
         // 'ready' and 'error' are handled during init; ignore here.
         return;
       }
       const pending = this.#pending.get(msg.id);
-      if (!pending) return;
+      if (!pending) {
+        log(this.#logger, 'warn', 'rpc.response.unmatched', {
+          id: msg.id,
+          outstandingOperationIds: this.#outstandingOperationIds(),
+        });
+        return;
+      }
       this.#pending.delete(msg.id);
       if (msg.error !== undefined) {
-        pending.reject(new Error(msg.error));
+        const error = new Error(msg.error);
+        if (pending.operationId !== undefined) this.#failOperation(pending.operationId, error);
+        pending.reject(error);
       } else {
+        if (pending.operationId !== undefined) {
+          this.#finishOperation(pending.operationId, msg.result);
+        }
         pending.resolve(msg.result);
       }
     });
+    worker.onError((error) => this.#workerFailed(error));
+    worker.onExit((code) => this.#workerExitedWith(code));
   }
 
   private call<T>(method: string, ...args: unknown[]): Promise<T> {
+    if (untrackedMethods.has(method)) return this.#request(method, args);
+    const operationId = this.#beginOperation(method, args);
+    return this.#request(method, args, operationId);
+  }
+
+  #request<T>(method: string, args: unknown[], operationId?: number): Promise<T> {
     if (this.#destroyed) {
-      return Promise.reject(new Error('LLDBClient has been destroyed'));
+      const error = new Error('LLDBClient has been destroyed');
+      if (operationId !== undefined) this.#failOperation(operationId, error);
+      return Promise.reject(error);
     }
     return new Promise<T>((resolve, reject) => {
       const id = this.#nextId++;
       this.#pending.set(id, {
         resolve: resolve as (v: unknown) => void,
         reject,
+        operationId,
       });
-      this.#worker.postMessage({ id, method, args });
+      try {
+        this.#worker.postMessage({ id, method, args, operationId });
+      } catch (error) {
+        this.#pending.delete(id);
+        const posted = error instanceof Error ? error : new Error(String(error));
+        if (operationId !== undefined) this.#failOperation(operationId, posted);
+        reject(posted);
+      }
     });
+  }
+
+  #beginOperation(method: string, args: unknown[]): number {
+    const id = this.#nextOperationId++;
+    const command =
+      (method === 'runCommand' || method === 'sessionCommand') && typeof args[0] === 'string'
+        ? args[0].slice(0, 240)
+        : undefined;
+    this.#operations.set(id, { method, command, queuedAt: now() });
+    log(this.#logger, 'debug', 'operation.queued', {
+      id,
+      method,
+      ...(command === undefined ? {} : { command }),
+    });
+    return id;
+  }
+
+  #startOperation(id: number): void {
+    const operation = this.#operations.get(id);
+    if (!operation || operation.startedAt !== undefined) return;
+    operation.startedAt = now();
+    log(this.#logger, 'debug', 'operation.started', {
+      id,
+      method: operation.method,
+      queueDurationMs: Math.round(operation.startedAt - operation.queuedAt),
+    });
+  }
+
+  #finishOperation(id: number, result: unknown): void {
+    const operation = this.#operations.get(id);
+    if (!operation) return;
+    const durationMs = Math.round(now() - operation.queuedAt);
+    const commandFailed =
+      (operation.method === 'runCommand' || operation.method === 'sessionCommand') &&
+      typeof result === 'object' &&
+      result !== null &&
+      'status' in result &&
+      typeof result.status === 'number' &&
+      result.status >= 6;
+    if (commandFailed) {
+      const commandResult = result as CommandResult;
+      this.#failOperation(id, new Error(commandResult.error || `LLDB status ${commandResult.status}`), {
+        status: commandResult.status,
+        durationMs,
+      });
+      return;
+    }
+    this.#operations.delete(id);
+    log(this.#logger, 'debug', 'operation.completed', {
+      id,
+      method: operation.method,
+      durationMs,
+    });
+  }
+
+  #failOperation(id: number, error: Error, extra: object = {}): void {
+    const operation = this.#operations.get(id);
+    if (!operation) return;
+    const outstandingOperationIds = this.#outstandingOperationIds();
+    this.#operations.delete(id);
+    log(this.#logger, 'error', 'operation.failed', {
+      id,
+      method: operation.method,
+      durationMs: Math.round(now() - operation.queuedAt),
+      error: error.message,
+      outstandingOperationIds,
+      ...extra,
+    });
+  }
+
+  #outstandingOperationIds(): number[] {
+    return [...this.#operations.keys()].sort((a, b) => a - b);
   }
 
   /**
@@ -182,44 +380,68 @@ export class LLDBClient {
    *   the copy bundled with this package.
    */
   static async create(options: LLDBClientOptions = {}): Promise<LLDBClient> {
+    const logger = options.logger ?? noopLogger;
     const workerUrl = options.workerUrl
       ? new URL(options.workerUrl)
       : new URL('./worker.js', import.meta.url);
-    const worker = await makeWorker(workerUrl);
+    let worker: WorkerLike;
+    try {
+      worker = await makeWorker(workerUrl);
+    } catch (error) {
+      log(logger, 'error', 'worker.errored', {
+        phase: 'start',
+        error: errorText(error),
+        outstandingOperationIds: [],
+      });
+      throw error;
+    }
+    log(logger, 'debug', 'worker.started', { workerUrl: workerUrl.href });
 
-    const client = new LLDBClient(worker);
+    const client = new LLDBClient(worker, logger);
 
     // Wait for either 'ready' or 'error' before resolving.
-    await new Promise<void>((resolve, reject) => {
-      const onMessage = (e: MessageEvent<WorkerMessage>) => {
-        const msg = e.data;
-        if (!('type' in msg)) return;
-        if (msg.type === 'ready') {
-          worker.removeEventListener('message', onMessage);
-          resolve();
-        } else if (msg.type === 'error') {
-          worker.removeEventListener('message', onMessage);
-          reject(new Error(msg.message));
-        }
-      };
-      worker.addEventListener('message', onMessage);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onMessage = (e: MessageEvent<WorkerMessage>) => {
+          const msg = e.data;
+          if (!('type' in msg)) return;
+          if (msg.type === 'ready') {
+            worker.removeEventListener('message', onMessage);
+            resolve();
+          } else if (msg.type === 'error') {
+            worker.removeEventListener('message', onMessage);
+            reject(new Error(msg.message));
+          }
+        };
+        worker.addEventListener('message', onMessage);
 
-      const wasmJsUrl = options.wasmJsUrl ?? new URL('../wasm/lldb-wasm.js', import.meta.url).href;
+        const wasmJsUrl =
+          options.wasmJsUrl ?? new URL('../wasm/lldb-wasm.js', import.meta.url).href;
 
-      const fileSAB = new SharedArrayBuffer(SAB_SIZE);
+        const fileSAB = new SharedArrayBuffer(SAB_SIZE);
 
-      const id = client.#nextId++;
-      client.#pending.set(id, { resolve: () => {}, reject });
-      worker.postMessage({ id, method: 'init', wasmJsUrl, fileSAB });
+        const id = client.#nextId++;
+        client.#pending.set(id, { resolve: () => {}, reject });
+        worker.postMessage({ id, method: 'init', wasmJsUrl, fileSAB });
 
-      // Start the file-provider watch loop on the main thread.
-      // Runs for the lifetime of this client; exits when #destroyed is true.
-      void watchForFileRequests(
-        fileSAB,
-        () => client.#fileProvider,
-        () => client.#destroyed,
+        // Start the file-provider watch loop on the main thread.
+        // Runs for the lifetime of this client; exits when #destroyed is true.
+        void watchForFileRequests(
+          fileSAB,
+          () => client.#fileProvider,
+          () => client.#destroyed,
+        );
+      });
+    } catch (error) {
+      client.#reportWorkerError(
+        error instanceof Error ? error : new Error(String(error)),
+        'initialization',
       );
-    });
+      await client.destroy();
+      throw error;
+    }
+
+    log(logger, 'debug', 'worker.ready');
 
     return client;
   }
@@ -395,8 +617,10 @@ export class LLDBClient {
   // In-process channel (for GDB server in the same wasm module)
   // -------------------------------------------------------------------------
 
-  createChannel(): Promise<number> {
-    return this.call('createChannel');
+  async createChannel(): Promise<number> {
+    const channelId = await this.call<number>('createChannel');
+    log(this.#logger, 'debug', 'channel.opened', { channelId });
+    return channelId;
   }
 
   connectInProcess(channelId: number): Promise<void> {
@@ -416,9 +640,10 @@ export class LLDBClient {
     return new Uint8Array(arr);
   }
 
-  destroyChannel(channelId: number): Promise<void> {
+  async destroyChannel(channelId: number): Promise<void> {
+    await this.call<void>('destroyChannel', channelId);
     this.#channelListeners.delete(channelId);
-    return this.call('destroyChannel', channelId);
+    log(this.#logger, 'debug', 'channel.closed', { channelId });
   }
 
   /**
@@ -427,14 +652,21 @@ export class LLDBClient {
    * Feed bytes from your transport back into LLDB with channelServerWrite().
    * Used to connect the in-wasm LLDB to an out-of-process GDB/platform server.
    */
-  bridgeChannel(channelId: number, onData: (data: Uint8Array) => void): Promise<void> {
+  async bridgeChannel(channelId: number, onData: (data: Uint8Array) => void): Promise<void> {
     this.#channelListeners.set(channelId, onData);
-    return this.call('bridgeChannelStart', channelId);
+    try {
+      await this.call('bridgeChannelStart', channelId);
+      log(this.#logger, 'debug', 'channel.bridge.opened', { channelId });
+    } catch (error) {
+      this.#channelListeners.delete(channelId);
+      throw error;
+    }
   }
 
-  unbridgeChannel(channelId: number): Promise<void> {
+  async unbridgeChannel(channelId: number): Promise<void> {
+    await this.call('bridgeChannelStop', channelId);
     this.#channelListeners.delete(channelId);
-    return this.call('bridgeChannelStop', channelId);
+    log(this.#logger, 'debug', 'channel.bridge.closed', { channelId });
   }
 
   // -------------------------------------------------------------------------
@@ -444,11 +676,24 @@ export class LLDBClient {
   // -------------------------------------------------------------------------
 
   async #sessionCall<T>(method: string, ...args: unknown[]): Promise<T> {
-    const sessionId = this.#sessionNextId++;
-    const result = new Promise<T>((resolve) => {
-      this.#sessionPending.set(sessionId, resolve as (v: unknown) => void);
+    if (this.#destroyed) return Promise.reject(new Error('LLDBClient has been destroyed'));
+    const operationId = this.#beginOperation(method, args);
+    const result = new Promise<T>((resolve, reject) => {
+      this.#sessionPending.set(operationId, {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+      });
     });
-    await this.call(method, sessionId, ...args); // submit (returns immediately)
+    try {
+      // Submission returns immediately. Completion and the true started event
+      // arrive separately from the native session thread, using operationId.
+      await this.#request(method, [operationId, ...args]);
+    } catch (error) {
+      this.#sessionPending.delete(operationId);
+      const submitted = error instanceof Error ? error : new Error(String(error));
+      this.#failOperation(operationId, submitted);
+      throw submitted;
+    }
     return result;
   }
 
@@ -516,12 +761,73 @@ export class LLDBClient {
    * client in the same process, otherwise the new worker can race the old one's
    * teardown.
    */
-  destroy(): void | Promise<void> {
+  destroy(): Promise<void> {
+    if (this.#destroyPromise) return this.#destroyPromise;
     this.#destroyed = true;
     this.#dapSession?.finish();
     const err = new Error('LLDBClient has been destroyed');
     for (const { reject } of this.#pending.values()) reject(err);
     this.#pending.clear();
-    return this.#worker.terminate();
+    for (const { reject } of this.#sessionPending.values()) reject(err);
+    this.#sessionPending.clear();
+    for (const id of this.#outstandingOperationIds()) this.#failOperation(id, err);
+    this.#closeRpc('destroy');
+    this.#destroyPromise = Promise.resolve(this.#worker.terminate()).then(() => {
+      this.#workerExitedWith();
+    });
+    return this.#destroyPromise;
+  }
+
+  #workerFailed(error: Error): void {
+    if (this.#workerExited) return;
+    this.#reportWorkerError(error);
+    this.#destroyed = true;
+    this.#dapSession?.finish(error.message);
+    this.#rejectOutstanding(error);
+    this.#closeRpc('worker-error');
+  }
+
+  #reportWorkerError(error: Error, phase?: string): void {
+    if (this.#workerErrorReported) return;
+    this.#workerErrorReported = true;
+    log(this.#logger, 'error', 'worker.errored', {
+      ...(phase === undefined ? {} : { phase }),
+      error: error.message,
+      outstandingOperationIds: this.#outstandingOperationIds(),
+    });
+  }
+
+  #workerExitedWith(code?: number): void {
+    if (this.#workerExited) return;
+    this.#workerExited = true;
+    const outstandingOperationIds = this.#outstandingOperationIds();
+    const unexpected = !this.#destroyed || outstandingOperationIds.length > 0;
+    log(this.#logger, unexpected ? 'error' : 'debug', 'worker.exited', {
+      ...(code === undefined ? {} : { code }),
+      outstandingOperationIds,
+    });
+    this.#destroyed = true;
+    if (unexpected) {
+      const error = new Error(
+        code === undefined ? 'LLDB worker exited' : `LLDB worker exited with code ${code}`,
+      );
+      this.#dapSession?.finish(error.message);
+      this.#rejectOutstanding(error);
+    }
+    this.#closeRpc('worker-exit');
+  }
+
+  #rejectOutstanding(error: Error): void {
+    for (const { reject } of this.#pending.values()) reject(error);
+    this.#pending.clear();
+    for (const { reject } of this.#sessionPending.values()) reject(error);
+    this.#sessionPending.clear();
+    for (const id of this.#outstandingOperationIds()) this.#failOperation(id, error);
+  }
+
+  #closeRpc(reason: string): void {
+    if (this.#rpcClosed) return;
+    this.#rpcClosed = true;
+    log(this.#logger, 'debug', 'rpc.closed', { reason });
   }
 }

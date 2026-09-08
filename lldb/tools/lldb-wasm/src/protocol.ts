@@ -10,7 +10,7 @@ export type Request =
       wasmJsUrl: string;
       fileSAB: SharedArrayBuffer;
     }
-  | { id: number; method: string; args: unknown[] };
+  | { id: number; method: string; args: unknown[]; operationId?: number };
 
 // Worker → Main thread (in response to a Request)
 export interface Response {
@@ -63,6 +63,14 @@ export interface SessionResultEvent {
   json: string;
 }
 
+// Worker → Main thread (an operation has begun executing). For session ops
+// this is emitted when the native session thread dequeues the operation, not
+// merely when the worker submits it.
+export interface OperationStartedEvent {
+  type: 'operationStarted';
+  id: number;
+}
+
 // Worker → Main thread (once wasm is loaded and LLDB is initialized)
 export interface ReadyMessage {
   type: 'ready';
@@ -82,5 +90,6 @@ export type WorkerMessage =
   | DAPExitEvent
   | ChannelDataEvent
   | SessionResultEvent
+  | OperationStartedEvent
   | ReadyMessage
   | ErrorMessage;

@@ -11,6 +11,7 @@ import type {
   DAPExitEvent,
   ChannelDataEvent,
   SessionResultEvent,
+  OperationStartedEvent,
   ReadyMessage,
   ErrorMessage,
 } from './protocol.js';
@@ -437,6 +438,7 @@ let drainTimer: ReturnType<typeof setInterval> | null = null;
 let drainBuf = 0;
 let sessionBuf = 0;
 let sessionLenPtr = 0;
+let sessionKindPtr = 0;
 let interpreterDraining = false;
 let dapDraining = false;
 const bridgedChannels = new Set<number>();
@@ -505,10 +507,15 @@ function drainSession(p: WorkerPort | undefined): void {
     const id = ccall(
       'lldb_wasm_session_poll',
       'number',
-      ['number', 'number', 'number'],
-      [sessionBuf, SESSION_BUF_SIZE, sessionLenPtr],
+      ['number', 'number', 'number', 'number'],
+      [sessionBuf, SESSION_BUF_SIZE, sessionLenPtr, sessionKindPtr],
     ) as number;
     if (id === 0) break;
+    const kind = mod.HEAPU32[sessionKindPtr >> 2] ?? 0;
+    if (kind === 0) {
+      p?.postMessage({ type: 'operationStarted', id } as OperationStartedEvent);
+      continue;
+    }
     const len = mod.HEAPU32[sessionLenPtr >> 2] ?? 0;
     const json = sessionDecoder.decode(mod.HEAPU8.subarray(sessionBuf, sessionBuf + len));
     p?.postMessage({ type: 'sessionResult', id, json } as SessionResultEvent);
@@ -520,6 +527,7 @@ function ensureDrainTimer(): void {
   if (!drainBuf) drainBuf = mod._malloc(DRAIN_BUF_SIZE);
   if (!sessionBuf) sessionBuf = mod._malloc(SESSION_BUF_SIZE);
   if (!sessionLenPtr) sessionLenPtr = mod._malloc(4);
+  if (!sessionKindPtr) sessionKindPtr = mod._malloc(4);
   drainTimer = setInterval(() => {
     const p = port();
     if (interpreterDraining) {
@@ -759,6 +767,9 @@ const dispatch = makeDispatch();
     }
 
     try {
+      if ('operationId' in req && req.operationId !== undefined) {
+        port.postMessage({ type: 'operationStarted', id: req.operationId } as OperationStartedEvent);
+      }
       const result = handler((req as { args: unknown[] }).args ?? []);
       const res: Response = { id: req.id, result };
       port.postMessage(res);

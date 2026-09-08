@@ -53,6 +53,22 @@ lldb.onStop(async (reason) => {
 await lldb.destroy();
 ```
 
+### Logging
+
+Pass a logger to record worker, RPC, channel, and LLDB operation lifecycle
+events. The interface is structural and matches common application loggers,
+so an existing logger can be passed directly:
+
+```js
+const lldb = await LLDBClient.create({ logger });
+```
+
+The logger must provide `debug(msg)`, `info(msg)`, `warn(msg)`, and
+`error(msg)`. Normal lifecycle events use `debug`; failures use `error` and
+include the IDs of all outstanding operations. LLDB command completion logs
+include total duration, while start logs include time spent queued. No logging
+is performed when `logger` is omitted.
+
 ### Debug Adapter Protocol
 
 The package also embeds upstream LLDB's Debug Adapter Protocol implementation.

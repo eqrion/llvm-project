@@ -7,6 +7,7 @@ export type {
   FileProvider,
   FrameInfo,
   LLDBClientOptions,
+  Logger,
   SessionVariable,
   StopReason,
   Variable,

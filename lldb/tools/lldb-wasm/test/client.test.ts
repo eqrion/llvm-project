@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { LLDBClient } from "../dist/index.js";
-import type { CommandResult, DAPSession, StopReason } from "../dist/index.js";
+import type { CommandResult, DAPSession, Logger, StopReason } from "../dist/index.js";
 import { workerUrl, wasmJsUrl, wasmAvailable } from "./helpers.js";
 
 const skip = !wasmAvailable();
@@ -12,6 +12,13 @@ const skip = !wasmAvailable();
 // All integration tests share a single LLDBClient to avoid loading 57MB of
 // wasm on every test. The client is created once and destroyed in afterAll.
 let lldb: LLDBClient;
+const logLines: string[] = [];
+const logger: Logger = {
+  debug: (message) => logLines.push(message),
+  info: (message) => logLines.push(message),
+  warn: (message) => logLines.push(message),
+  error: (message) => logLines.push(message),
+};
 
 type DAPMessage = Record<string, unknown>;
 
@@ -73,7 +80,7 @@ class DAPTestPeer {
 
 beforeAll(async () => {
   if (skip) return;
-  lldb = await LLDBClient.create({ workerUrl, wasmJsUrl });
+  lldb = await LLDBClient.create({ workerUrl, wasmJsUrl, logger });
 });
 
 afterAll(() => {
@@ -87,6 +94,21 @@ describe.skipIf(skip)("LLDBClient integration", () => {
 
   it("creates an LLDBClient", () => {
     expect(lldb).toBeInstanceOf(LLDBClient);
+  });
+
+  it("logs when the native session thread starts and completes an operation", async () => {
+    const firstNewLine = logLines.length;
+    expect((await lldb.sessionState()).reason).toBe("none");
+
+    const lifecycle = logLines
+      .slice(firstNewLine)
+      .filter((line) => line.includes("operation."));
+    expect(lifecycle).toHaveLength(3);
+    const id = lifecycle[0]?.match(/"id":(\d+)/)?.[1];
+    expect(id).toBeDefined();
+    expect(lifecycle[0]).toContain("operation.queued");
+    expect(lifecycle[1]).toContain(`operation.started {"id":${id}`);
+    expect(lifecycle[2]).toContain(`operation.completed {"id":${id}`);
   });
 
   // -------------------------------------------------------------------------
