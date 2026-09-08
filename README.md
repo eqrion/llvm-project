@@ -1,3 +1,11 @@
+# lldb-wasm
+
+This is a fork of llvm-project that compiles `lldb` to wasm and publishes it as the [`lldb-wasm` package](https://www.npmjs.com/package/lldb-wasm).
+
+You can view the tool in `./lldb/tools/lldb-wasm`.
+
+The original readme follows.
+
 # The LLVM Compiler Infrastructure
 
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
