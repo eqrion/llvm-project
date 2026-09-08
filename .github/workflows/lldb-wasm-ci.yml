@@ -1,0 +1,57 @@
+name: LLDB Wasm CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - lldb-wasm
+      - llvm-project-wasm
+    paths:
+      - .github/actions/build-lldb-wasm/**
+      - .github/workflows/lldb-wasm-ci.yml
+      - .github/workflows/lldb-wasm-release.yml
+      - clang/**
+      - cmake/**
+      - lldb/**
+      - llvm/**
+  pull_request:
+    paths:
+      - .github/actions/build-lldb-wasm/**
+      - .github/workflows/lldb-wasm-ci.yml
+      - .github/workflows/lldb-wasm-release.yml
+      - clang/**
+      - cmake/**
+      - lldb/**
+      - llvm/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lldb-wasm-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out LLVM
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and test lldb-wasm
+        id: package
+        uses: ./.github/actions/build-lldb-wasm
+
+      - name: Upload tested npm package
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: lldb-wasm-${{ steps.package.outputs.version }}-${{ github.sha }}
+          path: ${{ steps.package.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7

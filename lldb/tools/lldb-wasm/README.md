@@ -130,6 +130,26 @@ just npm-build   # copy artifacts + compile TypeScript
 
 See the root `justfile` for all available recipes.
 
+## Releasing
+
+Releases are built, tested, tagged, and published by GitHub Actions. To release:
+
+1. Update `version` in both `package.json` and `package-lock.json` (for example,
+   with `npm version 0.2.0 --no-git-tag-version`), then merge that change.
+2. Open **Actions > Release lldb-wasm > Run workflow**. Choose `latest` for a
+   normal release or `next` for a prerelease and run the workflow from the
+   commit to release.
+
+The workflow performs a clean LLVM/LLDB build on Ubuntu 24.04 with Emscripten
+6.0.3, runs the npm test suite, publishes the tested tarball to npm, and creates
+the matching `lldb-wasm-v<version>` tag and GitHub release.
+
+The repository owner must configure npm trusted publishing once for package
+`lldb-wasm`, repository `eqrion/llvm-project`, workflow
+`lldb-wasm-release.yml`, and GitHub environment `npm`, with `npm publish`
+allowed. No long-lived npm token is needed. The environment can be configured
+with required reviewers to add an approval gate before publishing.
+
 ## License
 
 Apache-2.0

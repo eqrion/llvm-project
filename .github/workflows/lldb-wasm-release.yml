@@ -1,0 +1,170 @@
+name: Release lldb-wasm
+
+on:
+  workflow_dispatch:
+    inputs:
+      npm_tag:
+        description: npm distribution tag
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - next
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lldb-wasm-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and test
+    if: github.repository == 'eqrion/llvm-project'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Check out LLVM
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        id: release
+        shell: bash
+        run: |
+          version=$(node -p "require('./lldb/tools/lldb-wasm/package.json').version")
+          lock_version=$(node -p "require('./lldb/tools/lldb-wasm/package-lock.json').version")
+          tag="lldb-wasm-v${version}"
+
+          if [[ "${version}" != "${lock_version}" ]]; then
+            echo "package.json (${version}) and package-lock.json (${lock_version}) disagree" >&2
+            exit 1
+          fi
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Package version is not valid release semver: ${version}" >&2
+            exit 1
+          fi
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null
+          tag_status=$?
+          set -e
+          case "${tag_status}" in
+            0)
+              echo "Git tag ${tag} already exists" >&2
+              exit 1
+              ;;
+            2) ;;
+            *)
+              echo "Could not check whether Git tag ${tag} exists" >&2
+              exit "${tag_status}"
+              ;;
+          esac
+
+          if npm_view=$(npm view "lldb-wasm@${version}" version 2>&1); then
+            echo "lldb-wasm@${version} is already published" >&2
+            exit 1
+          elif [[ "${npm_view}" != *E404* ]]; then
+            echo "Could not check whether lldb-wasm@${version} is published:" >&2
+            echo "${npm_view}" >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and test lldb-wasm
+        id: package
+        uses: ./.github/actions/build-lldb-wasm
+
+      - name: Verify the built version
+        shell: bash
+        env:
+          BUILT_VERSION: ${{ steps.package.outputs.version }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: test "${BUILT_VERSION}" = "${RELEASE_VERSION}"
+
+      - name: Upload tested npm package
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: lldb-wasm-release-${{ github.run_id }}
+          path: ${{ steps.package.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish and create release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.8.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm with trusted publishing support
+        shell: bash
+        run: |
+          npm install --global npm@11.6.2
+          npm --version
+
+      - name: Download tested npm package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lldb-wasm-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/lldb-wasm-package
+
+      - name: Locate and verify npm package
+        id: package
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          tarball=$(find "${RUNNER_TEMP}/lldb-wasm-package" -maxdepth 1 \
+            -type f -name '*.tgz' -print -quit)
+          test -n "${tarball}"
+          package_version=$(tar -xOzf "${tarball}" package/package.json \
+            | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => console.log(JSON.parse(data).version))")
+          test "${package_version}" = "${EXPECTED_VERSION}"
+          echo "tarball=${tarball}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish to npm
+        shell: bash
+        env:
+          NPM_TAG: ${{ inputs.npm_tag }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: npm publish "${TARBALL}" --access public --tag "${NPM_TAG}"
+
+      - name: Create tag and GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: |
+          release_args=(
+            "${RELEASE_TAG}"
+            "${TARBALL}"
+            --target "${GITHUB_SHA}"
+            --title "lldb-wasm ${RELEASE_VERSION}"
+            --generate-notes
+          )
+          if [[ "${RELEASE_VERSION}" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "${release_args[@]}"

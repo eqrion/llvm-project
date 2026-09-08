@@ -1,0 +1,74 @@
+name: Build and test lldb-wasm
+description: Build LLVM/LLDB with Emscripten, test the npm package, and pack it
+
+outputs:
+  tarball:
+    description: Path to the tested npm package tarball
+    value: ${{ steps.pack.outputs.tarball }}
+  version:
+    description: npm package version
+    value: ${{ steps.pack.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out Emscripten SDK 6.0.3
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      with:
+        repository: emscripten-core/emsdk
+        ref: db04e88298d9916fc51fcd3743045ca3eb695127 # 6.0.3
+        path: .ci/emsdk
+        persist-credentials: false
+
+    - name: Install Emscripten SDK 6.0.3
+      shell: bash
+      run: |
+        .ci/emsdk/emsdk install 6.0.3
+        .ci/emsdk/emsdk activate 6.0.3
+        .ci/emsdk/upstream/emscripten/emcc --version
+
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24.8.0
+        registry-url: https://registry.npmjs.org
+        package-manager-cache: false
+
+    - name: Install npm with trusted publishing support
+      shell: bash
+      run: |
+        npm install --global npm@11.6.2
+        npm --version
+
+    - name: Build LLVM and LLDB for WebAssembly
+      shell: bash
+      env:
+        EMSDK: ${{ github.workspace }}/.ci/emsdk
+      run: lldb/tools/lldb-wasm/scripts/build-ci.sh
+
+    - name: Install npm dependencies
+      shell: bash
+      working-directory: lldb/tools/lldb-wasm
+      run: npm ci
+
+    - name: Build and test npm package
+      shell: bash
+      working-directory: lldb/tools/lldb-wasm
+      run: npm test
+
+    - name: Pack and inspect npm package
+      id: pack
+      shell: bash
+      run: |
+        package_dir="${GITHUB_WORKSPACE}/lldb/tools/lldb-wasm"
+        artifact_dir="${RUNNER_TEMP}/lldb-wasm-package"
+        mkdir -p "${artifact_dir}"
+        npm pack "${package_dir}" --pack-destination "${artifact_dir}"
+        tarball=$(find "${artifact_dir}" -maxdepth 1 -type f -name '*.tgz' -print -quit)
+        test -n "${tarball}"
+        tar -tzf "${tarball}" | grep -Fx package/dist/index.js
+        tar -tzf "${tarball}" | grep -Fx package/wasm/lldb-wasm.js
+        tar -tzf "${tarball}" | grep -Fx package/wasm/lldb-wasm.wasm
+        version=$(node -p "require('${package_dir}/package.json').version")
+        echo "tarball=${tarball}" >> "${GITHUB_OUTPUT}"
+        echo "version=${version}" >> "${GITHUB_OUTPUT}"
